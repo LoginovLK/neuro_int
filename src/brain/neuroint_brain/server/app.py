@@ -203,14 +203,13 @@ class BrainServer:
 
     async def _broadcast(self, msg) -> None:
         payload = encode_message(msg)
-        dead: list[ServerConnection] = []
-        for client in self._clients:
+        # Snapshot: clients may (dis)connect while we await send() below —
+        # iterating the live set raises "Set changed size during iteration".
+        for client in list(self._clients):
             try:
                 await client.send(payload)
             except websockets.ConnectionClosed:
-                dead.append(client)
-        for client in dead:
-            self._clients.discard(client)
+                self._clients.discard(client)
 
     def _note_fps(self) -> None:
         now = time.monotonic()

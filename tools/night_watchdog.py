@@ -53,11 +53,12 @@ def log(message: str) -> None:
 def check_brain() -> tuple[bool, float, bool]:
     """(alive, fps, paused). fps>0 means edge + camera are producing."""
 
-    async def probe() -> tuple[bool, float, bool]:
+    async def probe() -> tuple[bool, float, bool, bool]:
         async with websockets.connect(BRAIN_URL, ping_interval=20, ping_timeout=15) as ws:
             t0 = time.monotonic()
             fps = 0.0
             paused = False
+            hands_seen = False
             while time.monotonic() - t0 < 3.0:
                 try:
                     raw = await asyncio.wait_for(ws.recv(), timeout=3.0)
@@ -66,12 +67,14 @@ def check_brain() -> tuple[bool, float, bool]:
                 msg = parse_message(raw)
                 if msg.type == "status":
                     fps, paused = msg.fps_inference, msg.paused
-        return True, fps, paused
+                    if msg.hands_seen > 0:
+                        hands_seen = True
+        return True, fps, paused, hands_seen
 
     try:
         return asyncio.run(probe())
     except Exception:  # noqa: BLE001 - any failure means brain is down
-        return False, 0.0, False
+        return False, 0.0, False, False
 
 
 def check_edge_ui() -> bool:
@@ -180,12 +183,19 @@ def main() -> int:
     while _watchdog_flag.exists():
         time.sleep(CHECK_INTERVAL_S)
 
-        brain_alive, fps, paused = check_brain()
+        brain_alive, fps, paused, hands_seen = check_brain()
         edge_alive = check_edge_ui()
 
         if not brain_alive:
             log("brain WS down -> docker compose up -d --wait")
             restart_brain()
+            continue
+
+        # A pause with a hand IN frame is an intentional user pause — never
+        # undo it (the user may be testing the kill switch). Only auto-clear
+        # a stray pause left behind while nobody was around.
+        if paused and hands_seen and edge_alive:
+            log("intentional pause (hand in frame) — leaving it alone")
             continue
 
         if fps == 0.0 and edge_alive:
@@ -206,17 +216,22 @@ def main() -> int:
             continue
 
         if paused:
-            # A stray pause must never survive the night silently.
-            log("brain paused -> toggling back on")
-            try:
+            # A pause with a hand IN frame is an intentional user pause —
+            # never undo it (the user may be testing the kill switch).
+            # Only a stray pause left with nobody around gets cleared.
+            if hands_seen:
+                log("intentional pause (hand in frame) — leaving it alone")
+            else:
+                log("stray pause with no hand in frame -> toggling back on")
+                try:
 
-                async def toggle() -> None:
-                    async with websockets.connect(BRAIN_URL) as ws:
-                        await ws.send('{"type": "command", "action": "pause_system"}')
+                    async def toggle() -> None:
+                        async with websockets.connect(BRAIN_URL) as ws:
+                            await ws.send('{"type": "command", "action": "pause_system"}')
 
-                asyncio.run(toggle())
-            except Exception as exc:  # noqa: BLE001
-                log(f"pause toggle failed: {exc}")
+                    asyncio.run(toggle())
+                except Exception as exc:  # noqa: BLE001
+                    log(f"pause toggle failed: {exc}")
             continue
 
         camera_strike_count = 0
