@@ -50,6 +50,8 @@ def main() -> int:
         LANDMARK_MODEL,
         score_threshold=cfg.palm_score_threshold,
         class_score_threshold=cfg.landmark_score_threshold,
+        tracking=cfg.tracking,
+        clahe=cfg.clahe,
     )
     act = CursorActuator(cfg.sensitivity, cfg.min_cutoff, cfg.beta)
     logger.info(
@@ -76,11 +78,13 @@ def main() -> int:
     fps_t = time.monotonic()
     fps_frames = 0
     fps = 0.0
+    last_seq = -1
+    canvas = None
     exit_code = 0
 
     try:
         while True:
-            frame = cam.read()
+            frame, seq = cam.read()
             if frame is None:
                 time.sleep(0.02)
                 if deadline is not None and time.monotonic() > deadline + 5:
@@ -89,47 +93,65 @@ def main() -> int:
                     break
                 continue
 
-            results = hands.detect(frame)
-            result = results[0] if results else None
-            if not results:
-                hands.reset_smoothing()
-            now = time.monotonic()
+            if seq != last_seq:
+                last_seq = seq
+                now = time.monotonic()
 
-            pointing = result is not None and is_pointing(result[0])
-            # Debounce both edges: ON after a few straight-pointing frames,
-            # OFF only after a grace period (single dropped detections must
-            # not stutter the cursor).
-            on_counter = on_counter + 1 if pointing else 0
-            off_counter = off_counter + 1 if not pointing else 0
-            if not active and on_counter >= cfg.debounce_frames:
-                active = True
-                act.reset()
-            elif active and off_counter >= cfg.debounce_off_frames:
-                active = False
+                results = hands.detect(frame)
+                result = results[0] if results else None
+                if not results:
+                    hands.reset_smoothing()
 
-            if active and result is not None:
-                fx, fy = result[0][8]  # index fingertip (already smoothed)
-                sx, sy = act.mapper.map(fx, fy)
-                if args.dry:
-                    moved += 1
-                    if moved % 15 == 1:
-                        logger.info("dry: cursor would move to %dx%d", sx, sy)
-                else:
-                    act.move(fx, fy, now)
-                    moved += 1
+                pointing = result is not None and is_pointing(result[0])
+                # Debounce both edges: ON after a few straight-pointing frames,
+                # OFF only after a grace period (single dropped detections must
+                # not stutter the cursor).
+                on_counter = on_counter + 1 if pointing else 0
+                off_counter = off_counter + 1 if not pointing else 0
+                if not active and on_counter >= cfg.debounce_frames:
+                    active = True
+                    act.reset()
+                elif active and off_counter >= cfg.debounce_off_frames:
+                    active = False
 
-            frames += 1
-            detected += 1 if result is not None else 0
-            pointing_frames += 1 if pointing else 0
-            fps_frames += 1
-            if now - fps_t >= 1.0:
-                fps = fps_frames / (now - fps_t)
-                fps_frames = 0
-                fps_t = now
-                logger.info("fps %.1f  hands %s  pointing %s  sens %.1f", fps, bool(result), active, act.sensitivity)
+                if active and result is not None:
+                    fx, fy = result[0][8]  # index fingertip (already smoothed)
+                    sx, sy = act.mapper.map(fx, fy)
+                    if args.dry:
+                        moved += 1
+                        if moved % 15 == 1:
+                            logger.info("dry: cursor would move to %dx%d", sx, sy)
+                    else:
+                        act.move(fx, fy, now)
+                        moved += 1
 
-            if show_window:
-                canvas = draw(frame, result, act.mapper.region(), fps, act.sensitivity, active)
+                frames += 1
+                detected += 1 if result is not None else 0
+                pointing_frames += 1 if pointing else 0
+                fps_frames += 1
+                if now - fps_t >= 1.0:
+                    fps = fps_frames / (now - fps_t)
+                    fps_frames = 0
+                    fps_t = now
+                    logger.info(
+                        "fps %.1f  hands %s  pointing %s  sens %.1f",
+                        fps,
+                        bool(result),
+                        active,
+                        act.sensitivity,
+                    )
+
+                if show_window:
+                    canvas = draw(
+                        frame,
+                        result,
+                        act.mapper.region(),
+                        fps,
+                        act.sensitivity,
+                        active,
+                    )
+
+            if show_window and canvas is not None:
                 cv2.imshow(win, cv2.resize(canvas, (960, 540)))
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), 27):
@@ -145,7 +167,7 @@ def main() -> int:
                     cfg.save()
                     logger.info("sensitivity %.1f (saved)", act.sensitivity)
 
-            if deadline is not None and now >= deadline:
+            if deadline is not None and time.monotonic() >= deadline:
                 break
     except KeyboardInterrupt:
         pass

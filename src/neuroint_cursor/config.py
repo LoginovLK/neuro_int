@@ -24,10 +24,12 @@ class Settings:
     sensitivity: float = 1.0
     min_cutoff: float = 1.2
     beta: float = 0.01
-    palm_score_threshold: float = 0.3
+    palm_score_threshold: float = 0.4
     landmark_score_threshold: float = 0.25
     debounce_frames: int = 3
     debounce_off_frames: int = 6
+    tracking: bool = True
+    clahe: bool = True
     debug_window: bool = True
 
     @classmethod

@@ -33,6 +33,7 @@ class Camera:
         self._cap = self._open(index, width, height, fps, open_retries)
         self._lock = threading.Lock()
         self._latest: object | None = None
+        self._seq = 0
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._drain, name="camera-drain", daemon=True)
         self._thread.start()
@@ -65,13 +66,20 @@ class Camera:
                     frame = cv2.flip(frame, 1)
                 with self._lock:
                     self._latest = frame
+                    self._seq += 1
             else:
                 self._stop.wait(0.05)
 
-    def read(self) -> object | None:
-        """Instant: always returns the newest frame (never None once started)."""
+    def read(self) -> tuple[object | None, int]:
+        """Instant: returns (newest frame, its sequence number).
+
+        The sequence lets the caller skip re-processing a frame it has
+        already seen — read() repeats delivery between camera frames
+        (never None once started), and duplicating inference on the same
+        frame wastes GPU and lies to the fps counter.
+        """
         with self._lock:
-            return self._latest
+            return self._latest, self._seq
 
     def close(self) -> None:
         self._stop.set()
