@@ -49,6 +49,13 @@ class EdgeSettings(BaseSettings):
     vision_onnx_palm: str = "models/palm_detection_full_inf_post_192x192.onnx"
     vision_onnx_landmark: str = "models/hand_landmark_sparse_Nx3x224x224.onnx"
 
+    # Detection thresholds. Low on purpose: a hand far from the camera makes
+    # a small palm with a weaker score, and a missed hand kills cursor
+    # steering entirely. False positives are harmless here (landmark stage
+    # re-checks every candidate with its own score).
+    vision_score_threshold: float = 0.3
+    vision_class_threshold: float = 0.25
+
     # Mirror the frame (selfie view): swipes then map intuitively —
     # swipe right -> fingertip moves right on screen.
     mirror: bool = True

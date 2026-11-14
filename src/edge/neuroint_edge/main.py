@@ -50,6 +50,8 @@ def main() -> None:
     hands_detector = OnnxHands(
         palm_model=settings.vision_onnx_palm,
         landmark_model=settings.vision_onnx_landmark,
+        score_threshold=settings.vision_score_threshold,
+        class_score_threshold=settings.vision_class_threshold,
         mirror=settings.mirror,
     )
     hub = UiHub()

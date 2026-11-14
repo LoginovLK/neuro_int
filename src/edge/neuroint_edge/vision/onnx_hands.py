@@ -216,6 +216,7 @@ class OnnxHands:
             xy[:, 0] = (xy[:, 0] * self._lm_hw[1] - lm_pad_w_half) / max(scale_w, 1e-6)
             xy[:, 1] = (xy[:, 1] * self._lm_hw[0] - lm_pad_h_half) / max(scale_h, 1e-6)
             # Crop-local pixels -> full frame pixels (rect offset) -> normalized.
+            palm_score = float(score)
             cx, cy, rect_w, rect_h = rect[0], rect[1], rect[2], rect[3]
             xy[:, 0] = (xy[:, 0] + cx - rect_w // 2) / image_w
             xy[:, 1] = (xy[:, 1] + cy - rect_h // 2) / image_h
@@ -236,8 +237,11 @@ class OnnxHands:
             for i, (x, y) in enumerate(xy):
                 sx, sy = self._smoothing[i].filter(float(x), float(y), now_s)
                 points.append((float(sx), float(sy)))
-            results.append((points, handedness))
-        return results
+            results.append((palm_score, points, handedness))
+
+        # Best hand first: the edge forwards only hands[0] to the brain FSM.
+        results.sort(key=lambda r: r[0], reverse=True)
+        return [(points, handedness) for _score, points, handedness in results]
 
     def reset_smoothing(self) -> None:
         """Drop filter history (call when the hand leaves the frame)."""

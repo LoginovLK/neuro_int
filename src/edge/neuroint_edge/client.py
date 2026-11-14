@@ -32,6 +32,7 @@ from neuroint_edge.actuator import KeyActuator, ScreenMapper
 from neuroint_edge.capture.base import FrameSource
 from neuroint_edge.capture.factory import create_capture
 from neuroint_edge.capture.quality import FrameEnhancer
+from neuroint_edge.capture.usb_reset import restart_camera_devices
 from neuroint_edge.config import EdgeSettings, persist_env
 from neuroint_edge.ui.hub import UiHub
 from neuroint_edge.vision.onnx_hands import OnnxHands
@@ -63,6 +64,7 @@ class EdgeClient:
         self._screen_mapper = ScreenMapper()
         self._brain_ws = None
         self._brain_paused = False
+        self._pending_pause = False
         self._last_cursor_active = False
         self._cursor_prev: tuple[float, float] | None = None
         self._auto_exp = self._build_auto_exposure()
@@ -74,6 +76,8 @@ class EdgeClient:
             max_workers=1, thread_name_prefix="gpu-detect"
         )
         self._read_failures = 0
+        self._rebuild_failures = 0
+        self._usb_restarted = False
 
     def _build_auto_exposure(self):
         """Zero-touch camera calibration (pseyepy only, when not pinned)."""
@@ -98,7 +102,12 @@ class EdgeClient:
 
     async def send_pause_toggle(self) -> None:
         if self._brain_ws is None:
-            logger.warning("pause_toggle: brain not connected")
+            # Edge is disconnected: remember the press, apply on reconnect.
+            self._pending_pause = not self._pending_pause
+            logger.warning(
+                "pause_toggle while disconnected — will apply on reconnect (%s)",
+                "queued" if self._pending_pause else "cleared",
+            )
             return
         await self._brain_ws.send('{"type": "command", "action": "pause_system"}')
 
@@ -121,6 +130,10 @@ class EdgeClient:
                             jpeg_quality=self._settings.jpeg_quality,
                         ).model_dump_json()
                     )
+                    if self._pending_pause:
+                        self._pending_pause = False
+                        await ws.send('{"type": "command", "action": "pause_system"}')
+                        logger.info("pending pause toggle applied on reconnect")
                     recv_task = asyncio.create_task(self._recv_loop(ws))
                     try:
                         await self._capture_loop(ws)
@@ -238,8 +251,20 @@ class EdgeClient:
             self._read_failures = 0
             self._cursor_prev = None
             logger.info("capture backend rebuilt: %s", self._source.name)
-        except Exception as exc:  # noqa: BLE001 - camera may be gone entirely
-            logger.error("capture rebuild failed: %s (will retry)", exc)
+        except Exception as exc:  # noqa: BLE001 - camera may be wedged at USB level
+            logger.error("capture rebuild failed: %s — restarting USB device", exc)
+            self._rebuild_failures += 1
+            if self._rebuild_failures >= 2 and not self._usb_restarted:
+                self._rebuild_failures = 0
+                ok = await loop.run_in_executor(None, restart_camera_devices)
+                self._usb_restarted = ok
+                if ok:
+                    logger.info("USB camera restart done, retrying capture")
+                else:
+                    logger.error(
+                        "USB restart unavailable (needs elevated shell): "
+                        "replug the camera or reboot the stack"
+                    )
             await asyncio.sleep(2.0)
 
     async def _recv_loop(self, ws) -> None:
