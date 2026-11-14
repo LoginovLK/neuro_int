@@ -1,0 +1,22 @@
+name: neuroint
+
+services:
+  brain:
+    build:
+      context: .
+      dockerfile: src/brain/Dockerfile
+    image: neuroint/brain:latest
+    # Loopback only: the gesture service must never be reachable from LAN.
+    ports:
+      - "127.0.0.1:8765:8765"
+    environment:
+      NEUROINT_LOG_LEVEL: ${NEUROINT_LOG_LEVEL:-INFO}
+    volumes:
+      - ./configs:/app/configs:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s = socket.create_connection(('127.0.0.1', 8765), timeout=2); s.close()"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 20s

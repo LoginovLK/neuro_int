@@ -1,0 +1,31 @@
+# Repository-level tooling config. The packages themselves live in src/*.
+[tool.pytest.ini_options]
+pythonpath = [".", "src/protocol", "src/brain", "src/edge"]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests", "tools"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",  # pycodestyle
+    "F",       # pyflakes
+    "I",       # import order
+    "UP",      # modernization
+    "B",       # bugbear
+    "S",       # bandit: security smells (public repo hygiene)
+    "C4",      # comprehensions
+]
+ignore = [
+    "E501", # line length is handled by formatter where practical
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]          # asserts are the point in tests
+"tools/*" = ["S101"]
+
+[tool.ruff.format]
+quote-style = "double"
