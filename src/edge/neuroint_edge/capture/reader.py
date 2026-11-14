@@ -39,11 +39,10 @@ class LatestFrameSource(FrameSource):
                 self._stop.wait(0.05)
 
     def read(self) -> object | None:
-        """Instant: returns the newest frame already read from the camera."""
+        """Instant: always returns the newest frame (never resets to None —
+        repeated delivery is harmless, a dropped frame would stall fps)."""
         with self._lock:
-            frame = self._latest
-            self._latest = None
-        return frame
+            return self._latest
 
     def close(self) -> None:
         self._stop.set()

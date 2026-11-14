@@ -231,9 +231,7 @@ class EdgeClient:
         if frame is None:
             logger.warning("camera returned no frame")
             await asyncio.sleep(0.2)
-        return frame
-
-    async def _rebuild_capture(self) -> None:
+        return frame    async def _rebuild_capture(self) -> None:
         logger.warning("rebuilding capture backend (%s)", self._source.name)
         loop = asyncio.get_running_loop()
         old_pool, self._read_pool = (
