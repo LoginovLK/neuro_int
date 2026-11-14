@@ -216,22 +216,9 @@ def main() -> int:
             continue
 
         if paused:
-            # A pause with a hand IN frame is an intentional user pause —
-            # never undo it (the user may be testing the kill switch).
-            # Only a stray pause left with nobody around gets cleared.
-            if hands_seen:
-                log("intentional pause (hand in frame) — leaving it alone")
-            else:
-                log("stray pause with no hand in frame -> toggling back on")
-                try:
-
-                    async def toggle() -> None:
-                        async with websockets.connect(BRAIN_URL) as ws:
-                            await ws.send('{"type": "command", "action": "pause_system"}')
-
-                    asyncio.run(toggle())
-                except Exception as exc:  # noqa: BLE001
-                    log(f"pause toggle failed: {exc}")
+            # Pause is a deliberate user action (kill switch) — never undone
+            # automatically. Morning session clears it by hand if needed.
+            log(f"brain paused by user — leaving alone (fps={fps})")
             continue
 
         camera_strike_count = 0
