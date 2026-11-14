@@ -27,7 +27,7 @@ class Settings:
     palm_score_threshold: float = 0.4
     landmark_score_threshold: float = 0.25
     debounce_frames: int = 3
-    debounce_off_frames: int = 6
+    debounce_off_frames: int = 10
     tracking: bool = True
     clahe: bool = True
     debug_window: bool = True

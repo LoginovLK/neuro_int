@@ -53,6 +53,7 @@ class CursorActuator:
         self.mapper = CursorMapper(self.screen_w, self.screen_h, sensitivity)
         self._filter = PointFilter2D(min_cutoff=min_cutoff, beta=beta)
         self._mouse = Controller()
+        self._last: tuple[float, float] | None = None
 
     @property
     def sensitivity(self) -> float:
@@ -64,9 +65,18 @@ class CursorActuator:
     def reset(self) -> None:
         """Drop filter history (call when control re-engages)."""
         self._filter.reset()
+        self._last = None
 
     def move(self, fx: float, fy: float, now_s: float) -> tuple[int, int]:
         sx, sy = self.mapper.map(fx, fy)
+        # Teleport: a hand re-acquired far from the last filtered position
+        # must snap, not glide across the screen (gliding reads as a jump).
+        if self._last is not None:
+            dist = ((sx - self._last[0]) ** 2 + (sy - self._last[1]) ** 2) ** 0.5
+            if dist > 0.35 * min(self.screen_w, self.screen_h):
+                self._filter.reset()
+                self._last = None
         sx, sy = self._filter.filter(sx, sy, now_s)
+        self._last = (sx, sy)
         self._mouse.position = (int(sx), int(sy))
         return int(sx), int(sy)

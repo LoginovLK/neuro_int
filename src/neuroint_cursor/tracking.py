@@ -30,7 +30,7 @@ TRACK_EMPTY_PALM_LIMIT = 2
 # 1.15^60 runaway growth on hallucinated landmarks.)
 TRACK_GROW_MAX = 1.15
 TRACK_SHRINK_MIN = 0.7
-TRACK_CENTER_JUMP = 0.6  # fraction of the previous ROI size
+TRACK_CENTER_JUMP = 0.8  # fraction of the previous ROI size
 
 
 def normalize_radians(angle: float) -> float:

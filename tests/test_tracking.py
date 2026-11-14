@@ -2,7 +2,7 @@
 
 from math import atan2, cos, degrees, hypot, radians, sin
 
-from neuroint_cursor.tracking import rect_from_landmarks
+from neuroint_cursor.tracking import TRACK_CENTER_JUMP, rect_from_landmarks
 from test_pointing import _rotate
 
 # Square frame: the synthetic hand is built in a unit square, a square
@@ -76,7 +76,7 @@ def test_center_jump_limited():
     dx = rect[0] - prev[0]
     dy = rect[1] - prev[1]
     dist = hypot(dx, dy)
-    assert dist <= 0.6 * 200 + 1  # center pulled to the jump limit
+    assert dist <= TRACK_CENTER_JUMP * 200 + 1  # center pulled to the jump limit
 
 
 def test_rotation_roundtrip():
