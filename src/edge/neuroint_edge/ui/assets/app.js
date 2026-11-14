@@ -93,6 +93,7 @@ function applyStatus(msg) {
   $("m-hands").textContent = String(msg.hands_seen);
   $("badge-paused").classList.toggle("hidden", !msg.paused);
   $("pause-btn").textContent = msg.paused ? "Resume" : "Pause";
+  $("paused-banner").classList.toggle("hidden", !msg.paused);
 }
 
 /* ---------- skeleton: drawn by the brain on the detected frame ----------

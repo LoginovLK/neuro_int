@@ -20,6 +20,9 @@ rules:
 - pose: open_palm
   hold: true
   action: pause_system
+- pose: fist
+  hold: true
+  action: pause_system
 - pose: pinch
   hold: true
   action: left_click
