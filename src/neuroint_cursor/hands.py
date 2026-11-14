@@ -75,6 +75,14 @@ NEAR_FACTOR = 1.5
 # ...and it only takes over when it beats the track by this margin
 # (a different hand must be clearly better, not noise-level better).
 SWITCH_MARGIN = 0.15
+# Bonus for a pointing candidate: a pointing hand must outscore a
+# non-pointing anchor (face at frame center) even at equal raw scores.
+POINTING_BONUS = 0.15
+# Sustained non-pointing stretch (frames) before a NEAR candidate may
+# take the track from a non-pointing holder: the hand in use flickers
+# out of pointing for a frame now and then, and a per-frame takeover
+# would switch sources and jerk the cursor.
+NP_RUN_MIN = 8
 # Velocity extrapolation: conservative on purpose — an EMA velocity lags
 # behind direction changes, and a confident wrong prediction oscillates
 # the crop around the hand (the "glitchy jerk" on sharp direction flips).
@@ -216,6 +224,7 @@ class OnnxHands:
         self._vel: tuple[float, float] | None = None
         self._last_center: tuple[float, float] | None = None
         self._last_t: float | None = None
+        self._np_run = 0
 
     def _drop_track(self) -> None:
         self._prev_points_norm = None
@@ -224,6 +233,7 @@ class OnnxHands:
         self._vel = None
         self._last_center = None
         self._last_t = None
+        self._np_run = 0
         self._miss = 0
         self._empty_palms = 0
         self.reset_smoothing()
@@ -360,10 +370,19 @@ class OnnxHands:
         dist = ((bcx - rect[0]) ** 2 + (bcy - rect[1]) ** 2) ** 0.5
         return dist <= 0.75 * rect[2]
 
+    def _eff(self, out: tuple[list[tuple[float, float]], str, float]) -> float:
+        """Effective score: pointing candidates outscore equal raw anchors."""
+        return out[2] + (POINTING_BONUS if is_pointing(out[0]) else 0.0)
+
     def detect(
-        self, frame_bgr: np.ndarray
+        self, frame_bgr: np.ndarray, prefer_pointing: bool = False
     ) -> list[tuple[list[tuple[float, float]], str, float]]:
-        """Full frame BGR -> list of (21 normalized landmarks, handedness, score)."""
+        """Full frame BGR -> list of (21 normalized landmarks, handedness, score).
+
+        prefer_pointing: the cursor is engaged — bridging a missed track
+        only accepts pointing candidates (a face anchor at frame center
+        must not steal the hand mid-use).
+        """
         image_h, image_w = frame_bgr.shape[:2]
         now_s = time.monotonic()
 
@@ -392,6 +411,12 @@ class OnnxHands:
                         )
                     )
                 out = self._landmark_from_rect(frame_bgr, rect, min_score=TRACK_SCORE_MIN)
+                if out is None:
+                    # motion blur dips the score; the crop is still centered
+                    # on the hand — one retry at the bare class threshold
+                    out = self._landmark_from_rect(
+                        frame_bgr, rect, min_score=self._class_score_threshold
+                    )
                 if out is not None and self._on_crop(out[0], rect, image_w, image_h):
                     track_out = out
                     track_rect = rect
@@ -422,20 +447,38 @@ class OnnxHands:
         if track_alive and track_out is not None:
             chosen, chosen_rect, source = track_out, track_rect, "track"
             track_pointing = is_pointing(track_out[0])
+            self._np_run = 0 if track_pointing else self._np_run + 1
             for out, rect in palm_cands:
                 d = hypot(rect[0] - track_rect[0], rect[1] - track_rect[1])
-                # a far candidate takes over when it is clearly better OR
-                # when it points and the track does not (a pointing hand
-                # must always beat a non-pointing phantom)
-                better = out[2] > track_out[2] + SWITCH_MARGIN
-                takeover = is_pointing(out[0]) and not track_pointing
-                if d > NEAR_FACTOR * track_rect[2] and (better or takeover):
+                cand_pointing = is_pointing(out[0])
+                if d > NEAR_FACTOR * track_rect[2]:
+                    # far candidate: a different object takes over when it
+                    # is clearly better OR when it points and the track
+                    # does not (pointing hand beats a face/junk anchor)
+                    better = out[2] > track_out[2] + SWITCH_MARGIN
+                    takeover = cand_pointing and not track_pointing
+                    if better or takeover:
+                        chosen, chosen_rect, source = out, rect, "switch"
+                        break
+                elif cand_pointing and not track_pointing and self._np_run >= NP_RUN_MIN:
+                    # NEAR takeover: the hand crossed in front of the face
+                    # (frame center) while the track sat on the face — the
+                    # pointing hand reclaims its track. Only after a
+                    # sustained non-pointing stretch, else the in-use
+                    # hand's pointing flicker would switch sources.
                     chosen, chosen_rect, source = out, rect, "switch"
                     break
         elif track_alive and self._prev_rect is not None:
             # tracked crop missed (blur / fast swipe): a palm candidate near
-            # the last position bridges the gap without resetting filters
-            best = max(palm_cands, key=lambda c: c[0][2], default=None)
+            # the last position bridges the gap without resetting filters.
+            # While the cursor is engaged, only pointing candidates may
+            # bridge — a face anchor at frame center must not steal it.
+            cands = palm_cands
+            if prefer_pointing:
+                pointing_only = [c for c in palm_cands if is_pointing(c[0][0])]
+                if pointing_only:
+                    cands = pointing_only
+            best = max(cands, key=lambda c: self._eff(c[0]), default=None)
             if best is not None:
                 out, rect = best
                 d = hypot(rect[0] - self._prev_rect[0], rect[1] - self._prev_rect[1])
@@ -444,7 +487,7 @@ class OnnxHands:
                 elif out[2] >= self._class_score_threshold + SWITCH_MARGIN:
                     chosen, chosen_rect, source = out, rect, "switch"
         else:
-            best = max(palm_cands, key=lambda c: c[0][2], default=None)
+            best = max(palm_cands, key=lambda c: self._eff(c[0]), default=None)
             if best is not None:
                 chosen, chosen_rect, source = best[0], best[1], "init"
 
