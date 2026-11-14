@@ -78,6 +78,7 @@ class EdgeClient:
         self._read_failures = 0
         self._rebuild_failures = 0
         self._usb_restarted = False
+        self._diag_counter = 0
 
     def _build_auto_exposure(self):
         """Zero-touch camera calibration (pseyepy only, when not pinned)."""
@@ -177,6 +178,13 @@ class EdgeClient:
             points, handedness = [], "Right"
             if hands:
                 points, handedness = hands[0]
+                self._diag_counter += 1
+                if self._diag_counter % 30 == 1:
+                    logger.info(
+                        "diag: detected %d hands, first has %d points",
+                        len(hands),
+                        len(points),
+                    )
 
             # Skeleton drawn on the exact frame the detector ran on.
             frame = draw_skeleton(frame, points, self._last_cursor_active)
@@ -191,6 +199,9 @@ class EdgeClient:
                     )
                 )
             )
+            self._diag_counter += 1
+            if self._diag_counter % 30 == 1:
+                logger.info("diag: sent LandmarksMsg with %d points", len(points))
 
             ok, jpeg = cv2.imencode(
                 ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), self._settings.jpeg_quality]
