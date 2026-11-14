@@ -48,7 +48,7 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 
-from neuroint_cursor.pose import is_pointing
+from neuroint_cursor.pose import is_pointing, palm_ratio, palm_sane
 from neuroint_cursor.smoothing import PointFilter2D
 from neuroint_cursor.tracker import HandTemplateTracker
 from neuroint_cursor.tracking import (
@@ -121,6 +121,20 @@ SIZE_ABS_MAX = 0.5        # fraction of min(frame_w, frame_h)
 TEMPLATE_START_SCORE = 0.55
 TEMPLATE_MIN_RESPONSE = 0.12
 REFIT_EVERY = 8
+
+# Tilted hands: the palm box angle can be tens of degrees off, and the
+# first landmark pass then hallucinates a SQUASHED hand (palm_ratio far
+# outside the hand band) while still scoring 0.9 — the emitted direction
+# is useless for correction (it points "up" regardless). On a sanity
+# failure the rect is re-inferred with rotated copies and the best sane
+# result wins (measured live: -17deg -> ratio 0.55 garbage, +28deg -> 0.98).
+ROTATION_RETRIES = (25.0, -25.0, 50.0, -50.0)
+
+# Face false positives: the palm model fires ALL OVER a face — several
+# conflicting boxes within one box-size radius (4 measured on Lev's face
+# vs 1 on a real hand). A crowded cluster is not a hand.
+CLUSTER_REJECT = 3
+CLUSTER_RADIUS_FACTOR = 1.0
 
 
 def _keep_aspect_resize_and_pad(
@@ -357,6 +371,53 @@ class OnnxHands:
         points = [(float(x), float(y)) for x, y in xy]
         return points, handedness, lm_score
 
+    def _landmark_smart(
+        self, frame_bgr: np.ndarray, rect: list[float], min_score: float | None = None
+    ) -> tuple[list[tuple[float, float]], str, float] | None:
+        """Landmark inference with rotation retries on a collapsed palm."""
+        base = self._landmark_from_rect(frame_bgr, rect, min_score)
+        if base is None and min_score is not None:
+            base = self._landmark_from_rect(
+                frame_bgr, rect, min_score=self._class_score_threshold
+            )
+        if base is not None and palm_sane(base[0]):
+            return base
+
+        best = base
+        best_key = None
+        if best is not None:
+            r = palm_ratio(best[0])
+            best_key = abs(r - 1.0) if r is not None else 99.0
+        eff = min_score if base is not None else self._class_score_threshold
+        for off in ROTATION_RETRIES:
+            rect2 = [rect[0], rect[1], rect[2], rect[3], rect[4] + off]
+            out = self._landmark_from_rect(frame_bgr, rect2, min_score=eff)
+            if out is None:
+                continue
+            if palm_sane(out[0]):
+                return out
+            r = palm_ratio(out[0])
+            key = abs(r - 1.0) if r is not None else 99.0
+            if best_key is None or key < best_key:
+                best, best_key = out, key
+        return best
+
+    @staticmethod
+    def _cluster_filter(rects: list[list[float]]) -> list[list[float]]:
+        """Drop boxes in crowded clusters (the model fires all over a face)."""
+        keep: list[list[float]] = []
+        for i, r in enumerate(rects):
+            neighbors = sum(
+                1
+                for j, q in enumerate(rects)
+                if j != i
+                and hypot(r[0] - q[0], r[1] - q[1]) < CLUSTER_RADIUS_FACTOR * r[2]
+            )
+            if neighbors + 1 >= CLUSTER_REJECT:
+                continue
+            keep.append(r)
+        return keep
+
     def _clamp_size(
         self, rect: list[float], now_s: float, frame_w: int, frame_h: int
     ) -> list[float]:
@@ -512,13 +573,7 @@ class OnnxHands:
                             -0.25 * image_h,
                         )
                     )
-                out = self._landmark_from_rect(frame_bgr, rect, min_score=TRACK_SCORE_MIN)
-                if out is None:
-                    # motion blur dips the score; the crop is still centered
-                    # on the hand — one retry at the bare class threshold
-                    out = self._landmark_from_rect(
-                        frame_bgr, rect, min_score=self._class_score_threshold
-                    )
+                out = self._landmark_smart(frame_bgr, rect, min_score=TRACK_SCORE_MIN)
                 if out is not None and self._on_crop(out[0], rect, image_w, image_h):
                     track_out = out
                     track_rect = rect
@@ -530,7 +585,7 @@ class OnnxHands:
         quarantining = now_s < self._excl_until
         qx, qy = self._excl_at
         qrad = QUARANTINE_RADIUS * min(image_w, image_h)
-        palm_rects = self._palm_rects(frame_bgr, palm_thr)
+        palm_rects = self._cluster_filter(self._palm_rects(frame_bgr, palm_thr))
         palm_cands: list[tuple[tuple[list[tuple[float, float]], str, float], list[float]]] = []
         for rect in palm_rects:
             # A big palm box is a close real hand — never quarantine-block it
@@ -538,7 +593,7 @@ class OnnxHands:
             big_hand = rect[2] > 0.18 * image_w
             if quarantining and not big_hand and hypot(rect[0] - qx, rect[1] - qy) <= qrad:
                 continue
-            out = self._landmark_from_rect(frame_bgr, rect)
+            out = self._landmark_smart(frame_bgr, rect)
             if out is not None:
                 palm_cands.append((out, rect))
 

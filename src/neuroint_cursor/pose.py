@@ -74,3 +74,21 @@ def is_pointing(pts: list[tuple[float, float]]) -> bool:
     if not state["index"] or state["middle"]:
         return False
     return not (state["ring"] and state["pinky"])
+
+
+def palm_ratio(pts: list[tuple[float, float]]) -> float | None:
+    """Palm length (wrist -> middle MCP) over palm width (index -> pinky MCP).
+
+    A real hand sits in ~0.65..2.2 for any orientation; the landmark model
+    squashed onto a tilted or non-hand crop collapses far outside that
+    band (measured 0.12..0.56 on garbage). None when degenerate.
+    """
+    palm_w = _dist(pts[INDEX_MCP], pts[PINKY_MCP])
+    if palm_w < 1e-6:
+        return None
+    return _dist(pts[WRIST], pts[MIDDLE_MCP]) / palm_w
+
+
+def palm_sane(pts: list[tuple[float, float]], lo: float = 0.65, hi: float = 2.2) -> bool:
+    r = palm_ratio(pts)
+    return r is not None and lo <= r <= hi
