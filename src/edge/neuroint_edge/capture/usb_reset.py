@@ -13,6 +13,7 @@ import subprocess
 logger = logging.getLogger(__name__)
 
 _POWERSHELL = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+_PNPUTIL = r"C:\Windows\System32\pnputil.exe"
 
 
 def restart_camera_devices() -> bool:
