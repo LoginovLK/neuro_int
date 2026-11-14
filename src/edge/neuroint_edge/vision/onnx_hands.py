@@ -80,13 +80,16 @@ def _rotate_and_crop(image: np.ndarray, rect: np.ndarray) -> np.ndarray:
     # rect comes in as float32: everything used for slicing must be int.
     cx, cy, rect_w, rect_h = int(rect[0]), int(rect[1]), int(rect[2]), int(rect[3])
     angle = float(rect[4])
-    size = (int((image.shape[1] ** 2 + image.shape[0] ** 2) ** 0.5) + 2) * 2
-    padded = np.zeros((size, size, 3), np.uint8)
-    start_w = (size - image.shape[1]) // 2
-    start_h = (size - image.shape[0]) // 2
-    padded[start_h : start_h + image.shape[0], start_w : start_w + image.shape[1], :] = image
-    cx += start_w
-    cy += start_h
+    # Mirror-reflection padding instead of black: a hand at the frame edge
+    # gets a seamless continuation, so the landmark model keeps its score
+    # (black-filled crops tanked detection near the borders).
+    pad_x = (image.shape[1] // 2) + rect_w
+    pad_y = (image.shape[0] // 2) + rect_h
+    padded = cv2.copyMakeBorder(
+        image, pad_y, pad_y, pad_x, pad_x, cv2.BORDER_REFLECT_101
+    )
+    cx += pad_x
+    cy += pad_y
 
     rect_tuple = ((cx, cy), (rect_w, rect_h), angle)
     box = cv2.boxPoints(rect_tuple)
