@@ -5,19 +5,23 @@ Ports the PINTO0309/hand-gesture-recognition-using-onnx pipeline:
      built into the ONNX graph
   2. hand_landmark_sparse_Nx3x224x224.onnx — 21 landmarks per hand
 
-Runs through onnxruntime DirectML on the RTX GPU. Two stability layers on
-top of the raw decode (this is what stops the bones from sliding):
+Runs through onnxruntime DirectML on the RTX GPU. Detection runs as a
+hybrid every frame (the v1-proven base with tracking on top):
 
-- **Tracking** (like MediaPipe and the PINTO repo's use_tracking): the ROI
-  for the landmark model is rebuilt each frame from the previous frame's
-  landmarks; the palm detector only runs to (re)acquire a lost hand. A
-  palm box re-detected from scratch every frame jitters slightly, and the
-  jittered crop makes the landmarks slide.
-- **CLAHE** on the palm frame and on every landmark crop (the proven v1
-  quality step): dim indoor frames from a 76fps webcam mode are noisy and
-  low-contrast, which tanked palm scores.
+- palm detector every frame — fresh ground-truth candidates;
+- a tracked candidate: ROI rebuilt from the previous frame's chosen
+  landmarks (MediaPipe/PINTO use_tracking style), with growth/center
+  limiters so one bad frame cannot blow the crop up into a feedback
+  spiral of garbage;
+- the best candidate wins by landmark score, with stickiness toward the
+  tracked one (hysteresis) so bones do not jump between sources.
 
-Every decode fix from the old pipeline is preserved here verbatim:
+The crop->frame decode is the exact inverse of the rotated-crop transform
+(rotation included; verified empirically with a synthetic marker) — the
+old translation-only decode was off by sin(angle)*distance for tilted
+hands. CLAHE runs on the palm frame and every crop (dark-room contrast).
+
+Decode fixes from the old pipeline preserved verbatim:
 - rr_cx is already normalized to the frame (double-normalization bug)
 - rr_cy un-pad needs the /scale step (hand drifting 200px bug)
 - BORDER_REFLECT_101 padding in rotate_and_crop (edge-of-frame bug)
@@ -29,18 +33,19 @@ from __future__ import annotations
 
 import logging
 import time
-from math import atan2, cos, pi, sin
+from collections import deque
+from math import atan2, cos, hypot, pi, sin
 from pathlib import Path
 
 import cv2
 import numpy as np
 import onnxruntime as ort
 
+from neuroint_cursor.pose import is_pointing
 from neuroint_cursor.smoothing import PointFilter2D
 from neuroint_cursor.tracking import (
     TRACK_EMPTY_PALM_LIMIT,
     TRACK_MISS_LIMIT,
-    TRACK_RECHECK_EVERY,
     TRACK_SCORE_MIN,
     normalize_radians,
     rect_from_landmarks,
@@ -56,6 +61,31 @@ HAND_CONNECTIONS = [
     (13, 17), (17, 18), (18, 19), (19, 20),
     (0, 17),
 ]
+
+# Stickiness: the tracked candidate wins ties up to this score gap, so
+# bones do not jump between the (smoother) track and the (fresher) palm
+# candidate every frame.
+TRACK_STICKINESS = 0.1
+
+# Static-object rejection: shelf junk / furniture edges get detected as a
+# palm and then tracked forever. A real hand always micro-sways, and a
+# hand HELD deliberately still is in pointing pose (in use). So: an
+# object whose ROI center has not moved for STATIC_SECONDS while never
+# pointing is not a hand — drop it and quarantine that spot for
+# QUARANTINE_SECONDS (palm candidates there are ignored).
+STATIC_SECONDS = 2.0
+STATIC_SPREAD = 0.10      # fraction of min(frame_w, frame_h)
+QUARANTINE_SECONDS = 8.0
+QUARANTINE_RADIUS = 0.08  # fraction of min(frame_w, frame_h)
+
+# Tracked-ROI size, bounded over a sliding window: hallucinated landmarks
+# inflate the bbox a few percent per frame, which compounds. A real hand
+# changes size slower than this over 1.5s (fast approach is carried by
+# the palm path, whose crops are unbounded).
+SIZE_WINDOW_SECONDS = 1.5
+SIZE_GROW_MAX = 1.3       # vs the largest size seen in the window
+SIZE_SHRINK_MIN = 0.8     # vs the smallest size seen in the window
+SIZE_ABS_MAX = 0.5        # fraction of min(frame_w, frame_h)
 
 
 def _keep_aspect_resize_and_pad(
@@ -128,7 +158,7 @@ class OnnxHands:
         self,
         palm_model: str | Path,
         landmark_model: str | Path,
-        score_threshold: float = 0.3,
+        score_threshold: float = 0.4,
         class_score_threshold: float = 0.25,
         tracking: bool = True,
         clahe: bool = True,
@@ -154,20 +184,29 @@ class OnnxHands:
         self._tracking = tracking
         self._clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) if clahe else None
 
-        self._smoothing: list[PointFilter2D] | None = None
-        self._smooth_time: float | None = None
+        self._filters: list[PointFilter2D] | None = None
         self._prev_points_norm: list[tuple[float, float]] | None = None
         self._prev_dir: tuple[float, float] | None = None
+        self._prev_rect: list[float] | None = None
+        self._last_source: str | None = None
         self._miss = 0
-        self._frame_no = 0
         self._empty_palms = 0
+        self._hist: deque[tuple[float, float, float]] = deque()
+        self._size_hist: deque[tuple[float, float]] = deque()
+        self._excl_until = 0.0
+        self._excl_at: tuple[float, float] = (0.0, 0.0)
 
     def _drop_track(self) -> None:
         self._prev_points_norm = None
         self._prev_dir = None
+        self._prev_rect = None
         self._miss = 0
         self._empty_palms = 0
         self.reset_smoothing()
+
+    def reset_smoothing(self) -> None:
+        """Drop filter history (call when the hand leaves the frame)."""
+        self._filters = None
 
     def _enhance(self, image: np.ndarray) -> np.ndarray:
         """CLAHE on the L channel (proven v1 quality step; cheap on crops)."""
@@ -219,7 +258,11 @@ class OnnxHands:
     def _landmark_from_rect(
         self, frame_bgr: np.ndarray, rect: list[float], min_score: float | None = None
     ) -> tuple[list[tuple[float, float]], str, float] | None:
-        """Stage 2 on one rect: crop -> CLAHE -> landmarks -> normalized pts."""
+        """Stage 2 on one rect: crop -> CLAHE -> landmarks -> normalized pts.
+
+        Returns RAW (unsmoothed) points; smoothing happens once per frame
+        on the winning candidate only.
+        """
         image_h, image_w = frame_bgr.shape[:2]
         crop = _rotate_and_crop(frame_bgr, np.asarray(rect, dtype=np.float32))
         if crop.size == 0:
@@ -244,29 +287,25 @@ class OnnxHands:
         xy = np.asarray([[p[0], p[1]] for p in lms], dtype=np.float32)
         xy[:, 0] = (xy[:, 0] * self._lm_hw[1] - lm_pad_w_half) / max(scale_w, 1e-6)
         xy[:, 1] = (xy[:, 1] * self._lm_hw[0] - lm_pad_h_half) / max(scale_h, 1e-6)
-        # Crop-local pixels -> full frame pixels (rect offset) -> normalized.
+
+        # Crop-local pixels -> frame pixels: exact inverse of the rotated
+        # crop (empirically verified with a synthetic marker):
+        #   frame = center + R(+angle) @ (crop_xy - rect_size/2)
         cx, cy, rect_w, rect_h = rect[0], rect[1], rect[2], rect[3]
-        xy[:, 0] = (xy[:, 0] + cx - rect_w // 2) / image_w
-        xy[:, 1] = (xy[:, 1] + cy - rect_h // 2) / image_h
+        a = np.radians(rect[4])
+        ca, sa = np.cos(a), np.sin(a)
+        ux = xy[:, 0] - rect_w / 2.0
+        uy = xy[:, 1] - rect_h / 2.0
+        xy[:, 0] = cx + ux * ca - uy * sa
+        xy[:, 1] = cy + ux * sa + uy * ca
+        xy[:, 0] /= image_w
+        xy[:, 1] /= image_h
 
         # Display-only label: frames are mirrored at capture, so the
         # model's handedness is not used for control logic anywhere.
         handedness = "Right" if float(handed[0][0]) > 0.5 else "Left"
 
-        # One Euro smoothing per landmark: kills jitter without adding
-        # noticeable latency to fast pointing.
-        now_s = time.monotonic()
-        if self._smoothing is None or self._smooth_time is None:
-            self._smoothing = [PointFilter2D(min_cutoff=0.7, beta=0.015) for _ in range(21)]
-            self._smooth_time = now_s
-        self._smooth_time = now_s
-        points = [
-            (float(sx), float(sy))
-            for (sx, sy) in (
-                self._smoothing[i].filter(float(x), float(y), now_s)
-                for i, (x, y) in enumerate(xy)
-            )
-        ]
+        points = [(float(x), float(y)) for x, y in xy]
         return points, handedness, lm_score
 
     def detect(
@@ -274,39 +313,111 @@ class OnnxHands:
     ) -> list[tuple[list[tuple[float, float]], str, float]]:
         """Full frame BGR -> list of (21 normalized landmarks, handedness, score)."""
         image_h, image_w = frame_bgr.shape[:2]
-        self._frame_no += 1
-        results: list[tuple[float, list[tuple[float, float]], str]] = []
 
-        # --- tracked hand first: ROI from the previous frame's landmarks ---
+        # --- palm detector: fresh ground-truth candidates, every frame ---
+        palm_results: list[tuple[list[tuple[float, float]], str, float]] = []
+        now_s = time.monotonic()
+        quarantining = now_s < self._excl_until
+        qx, qy = self._excl_at
+        qrad = QUARANTINE_RADIUS * min(image_w, image_h)
+        palm_rects = self._palm_rects(frame_bgr)
+        for rect in palm_rects:
+            if quarantining and hypot(rect[0] - qx, rect[1] - qy) <= qrad:
+                continue
+            out = self._landmark_from_rect(frame_bgr, rect)
+            if out is not None:
+                palm_results.append(out)
+
+        # --- tracked candidate: ROI from the previous frame's winner ---
+        track_out: tuple[list[tuple[float, float]], str, float] | None = None
+        track_rect: list[float] | None = None
         track_alive = self._tracking and self._prev_points_norm is not None
         if track_alive:
             rect, self._prev_dir = rect_from_landmarks(
-                self._prev_points_norm, image_w, image_h, self._prev_dir
+                self._prev_points_norm, image_w, image_h, self._prev_dir, self._prev_rect
             )
             if rect is not None:
+                rect = self._clamp_size(rect, now_s, image_w, image_h)
                 out = self._landmark_from_rect(frame_bgr, rect, min_score=TRACK_SCORE_MIN)
-                if out is not None:
-                    results.append((out[2], out[0], out[1]))
+                if out is not None and self._on_crop(out[0], rect, image_w, image_h):
+                    track_out = out
+                    track_rect = rect
 
-        # --- palm detection: acquisition, plus a periodic cross-check of a
-        # live track (a false-positive track — shelf junk, face — would
-        # otherwise renew itself forever while no real hand is in frame) ---
-        do_recheck = (not track_alive) or (not results) or (
-            self._frame_no % TRACK_RECHECK_EVERY == 0
-        )
-        if do_recheck:
-            palm_rects = self._palm_rects(frame_bgr)
-            if palm_rects:
-                self._empty_palms = 0
-                palm_results: list[tuple[float, list[tuple[float, float]], str]] = []
-                for rect in palm_rects:
-                    out = self._landmark_from_rect(frame_bgr, rect)
-                    if out is not None:
-                        palm_results.append((out[2], out[0], out[1]))
-                if palm_results:
-                    # palm evidence is ground truth and wins over the track
-                    results = palm_results
-            elif track_alive and results:
+        # --- choose the winner (stickiness toward the tracked candidate) ---
+        palm_best = max(palm_results, key=lambda r: r[2], default=None)
+        if palm_best is not None and track_out is not None:
+            if track_out[2] >= palm_best[2] - TRACK_STICKINESS:
+                chosen, chosen_rect, source = track_out, track_rect, "track"
+            else:
+                chosen, chosen_rect, source = palm_best, None, "palm"
+        elif palm_best is not None:
+            chosen, chosen_rect, source = palm_best, None, "palm"
+        elif track_out is not None:
+            chosen, chosen_rect, source = track_out, track_rect, "track"
+        else:
+            chosen, chosen_rect, source = None, None, None
+
+        if chosen is not None:
+            self._miss = 0
+            self._empty_palms = 0
+            if source != self._last_source:
+                self.reset_smoothing()  # a jump between sources must not smear
+            self._last_source = source
+            # One Euro on the winner only — one update per landmark per frame.
+            if self._filters is None:
+                self._filters = [PointFilter2D(min_cutoff=0.7, beta=0.015) for _ in range(21)]
+            points = [
+                (float(sx), float(sy))
+                for sx, sy in (
+                    self._filters[i].filter(x, y, now_s)
+                    for i, (x, y) in enumerate(chosen[0])
+                )
+            ]
+            self._prev_points_norm = points
+            if chosen_rect is None:
+                chosen_rect, _ = rect_from_landmarks(
+                    points, image_w, image_h, self._prev_dir, None
+                )
+            self._prev_rect = chosen_rect
+            results = [(points, chosen[1], chosen[2])]
+
+            # --- static-object rejection (see constants above) ---
+            self._hist.append((now_s, chosen_rect[0], chosen_rect[1]))
+            horizon = now_s - STATIC_SECONDS
+            while self._hist and self._hist[0][0] < horizon:
+                self._hist.popleft()
+            if (
+                len(self._hist) >= 15
+                and self._hist[-1][0] - self._hist[0][0] >= STATIC_SECONDS * 0.8
+                and not is_pointing(points)
+            ):
+                cxs = [c for _, c, _ in self._hist]
+                cys = [c for _, _, c in self._hist]
+                spread = hypot(max(cxs) - min(cxs), max(cys) - min(cys))
+                if spread <= STATIC_SPREAD * min(image_w, image_h):
+                    self._excl_at = (
+                        cxs[-1] / image_w,
+                        cys[-1] / image_h,
+                    )
+                    self._excl_until = now_s + QUARANTINE_SECONDS
+                    self._hist.clear()
+                    self._drop_track()
+                    results = []
+                    logger.info(
+                        "static object at (%.2f, %.2f) quarantined %.0fs",
+                        self._excl_at[0],
+                        self._excl_at[1],
+                        QUARANTINE_SECONDS,
+                    )
+        else:
+            self._miss += 1
+            if self._miss > TRACK_MISS_LIMIT:
+                self._drop_track()
+            results = []
+
+        # --- phantom guard: palm sees NOTHING anywhere while a track lives ---
+        if not palm_rects:
+            if track_alive and results:
                 self._empty_palms += 1
                 if self._empty_palms >= TRACK_EMPTY_PALM_LIMIT:
                     self._drop_track()
@@ -314,19 +425,33 @@ class OnnxHands:
             else:
                 self._empty_palms = 0
 
-        # --- tracking state update ---
-        if results:
-            self._miss = 0
-            self._prev_points_norm = results[0][1]
-        else:
-            self._miss += 1
-            if self._miss > TRACK_MISS_LIMIT:
-                self._drop_track()
+        return results
 
-        results.sort(key=lambda r: r[0], reverse=True)
-        return [(points, handedness, score) for score, points, handedness in results]
+    def _clamp_size(
+        self, rect: list[float], now_s: float, frame_w: int, frame_h: int
+    ) -> list[float]:
+        """Bound the tracked ROI size over a sliding window (anti-runaway)."""
+        self._size_hist.append((now_s, float(rect[2])))
+        horizon = now_s - SIZE_WINDOW_SECONDS
+        while self._size_hist and self._size_hist[0][0] < horizon:
+            self._size_hist.popleft()
+        sizes = [s for _, s in self._size_hist]
+        lo = min(sizes) * SIZE_SHRINK_MIN
+        hi = max(max(sizes) * SIZE_GROW_MAX, 64.0)
+        hi = min(hi, SIZE_ABS_MAX * min(frame_w, frame_h))
+        rect[2] = rect[3] = int(min(max(rect[2], lo), hi))
+        return rect
 
-    def reset_smoothing(self) -> None:
-        """Drop filter history (call when the hand leaves the frame)."""
-        self._smoothing = None
-        self._smooth_time = None
+    def _on_crop(
+        self,
+        points: list[tuple[float, float]],
+        rect: list[float],
+        frame_w: int,
+        frame_h: int,
+    ) -> bool:
+        """Garbage gate: the landmark cluster must sit on the tracked crop."""
+        xs = [p[0] * frame_w for p in points]
+        ys = [p[1] * frame_h for p in points]
+        bcx, bcy = (max(xs) + min(xs)) / 2.0, (max(ys) + min(ys)) / 2.0
+        dist = ((bcx - rect[0]) ** 2 + (bcy - rect[1]) ** 2) ** 0.5
+        return dist <= 0.75 * rect[2]

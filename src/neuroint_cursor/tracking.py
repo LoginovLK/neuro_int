@@ -21,11 +21,16 @@ TRACK_MISS_LIMIT = 10
 # positive (face, keyboard edges) usually scores lower. Holding a track
 # needs the higher bar, so junk tracks die quickly and palm re-acquires.
 TRACK_SCORE_MIN = 0.4
-# Cross-check the tracked hand against the palm detector every N frames:
-# if the palm detector sees NO palm anywhere while a track is alive, the
-# track is a false positive (shelf junk, face) and dies after K checks.
-TRACK_RECHECK_EVERY = 12
+# Palm sees nothing anywhere while a track lives -> phantom track, dies
+# after this many consecutive empty palm frames.
 TRACK_EMPTY_PALM_LIMIT = 2
+# Per-frame growth limits for the tracked ROI: a real hand cannot double
+# in size or teleport half a frame in 33ms. (Compounding is bounded again
+# in hands.py over a 1.5s window — per-frame limits alone still allow
+# 1.15^60 runaway growth on hallucinated landmarks.)
+TRACK_GROW_MAX = 1.15
+TRACK_SHRINK_MIN = 0.7
+TRACK_CENTER_JUMP = 0.6  # fraction of the previous ROI size
 
 
 def normalize_radians(angle: float) -> float:
@@ -37,12 +42,15 @@ def rect_from_landmarks(
     frame_w: int,
     frame_h: int,
     prev_dir: tuple[float, float] | None,
+    prev_rect: list[float] | None = None,
 ) -> tuple[list[float] | None, tuple[float, float]]:
     """Build the next tracked ROI from the previous frame's landmarks.
 
     Rotation follows the wrist -> middle-finger-MCP axis (the same
     convention the palm detector uses), smoothed as a direction vector
-    (no angle wrap issues). Returns (rect | None, smoothed direction).
+    (no angle wrap issues). With prev_rect given, size and center are
+    limited per frame so garbage input cannot explode the crop.
+    Returns (rect | None, smoothed direction).
     """
     px = [(x * frame_w, y * frame_h) for x, y in points_norm]
     wrist, mid = px[0], px[9]
@@ -62,7 +70,18 @@ def rect_from_landmarks(
     xs = [p[0] for p in px]
     ys = [p[1] for p in px]
     diag = hypot(max(xs) - min(xs), max(ys) - min(ys))
-    size = int(min(0.9 * min(frame_w, frame_h), max(48.0, TRACK_SIZE_FACTOR * diag)))
-    cx = int((max(xs) + min(xs)) / 2)
-    cy = int((max(ys) + min(ys)) / 2)
-    return [cx, cy, size, size, degrees(rotation)], d
+    size = min(0.9 * min(frame_w, frame_h), max(48.0, TRACK_SIZE_FACTOR * diag))
+    cx = (max(xs) + min(xs)) / 2
+    cy = (max(ys) + min(ys)) / 2
+
+    if prev_rect is not None:
+        psize = float(prev_rect[2])
+        size = min(max(size, TRACK_SHRINK_MIN * psize), TRACK_GROW_MAX * psize)
+        jump = TRACK_CENTER_JUMP * psize
+        ddx, ddy = cx - prev_rect[0], cy - prev_rect[1]
+        dist = hypot(ddx, ddy)
+        if dist > jump > 0:
+            cx = prev_rect[0] + ddx * jump / dist
+            cy = prev_rect[1] + ddy * jump / dist
+
+    return [int(cx), int(cy), int(size), int(size), degrees(rotation)], d

@@ -22,7 +22,7 @@ def _vertical_hand():
 
 def test_pointing_up_gives_zero_rotation():
     pts = _vertical_hand()
-    rect, d = rect_from_landmarks(pts, FRAME_W, FRAME_H, None)
+    rect, d = rect_from_landmarks(pts, FRAME_W, FRAME_H, None, None)
     assert rect is not None
     cx, cy, w, h, deg = rect
     assert abs(deg) < 1.0  # pointing up -> no crop rotation
@@ -36,26 +36,47 @@ def test_pointing_up_gives_zero_rotation():
 def test_rotation_follows_hand_angle():
     for deg in (30, -45):
         pts = _rotate(_vertical_hand(), deg)
-        rect, _ = rect_from_landmarks(pts, FRAME_W, FRAME_H, None)
+        rect, _ = rect_from_landmarks(pts, FRAME_W, FRAME_H, None, None)
         assert rect is not None
         assert abs(rect[4] - deg) < 2.0, f"expected ~{deg}, got {rect[4]}"
 
 
 def test_direction_smoothing_is_stable():
     pts = _vertical_hand()
-    _, d1 = rect_from_landmarks(pts, FRAME_W, FRAME_H, None)
-    _, d2 = rect_from_landmarks(pts, FRAME_W, FRAME_H, d1)
+    _, d1 = rect_from_landmarks(pts, FRAME_W, FRAME_H, None, None)
+    _, d2 = rect_from_landmarks(pts, FRAME_W, FRAME_H, d1, None)
     assert abs(d1[0] - d2[0]) < 0.1 and abs(d1[1] - d2[1]) < 0.1
     assert abs(hypot(d2[0], d2[1]) - 1.0) < 1e-6  # stays a unit vector
 
 
 def test_wrist_centered_roi():
     pts = _vertical_hand()
-    rect, _ = rect_from_landmarks(pts, FRAME_W, FRAME_H, None)
+    rect, _ = rect_from_landmarks(pts, FRAME_W, FRAME_H, None, None)
     cx, cy = rect[0], rect[1]
     # bbox center of an up-pointing hand sits above the wrist (y=0.8*1000)
     assert cy < 0.8 * FRAME_H
     assert 0 < cx < FRAME_W
+
+
+def test_growth_limited_by_prev_rect():
+    """A garbage landmark frame must not blow the crop up."""
+    pts = _vertical_hand()
+    prev = [500, 600, 200, 200, 0.0]  # small previous ROI
+    rect, _ = rect_from_landmarks(pts, FRAME_W, FRAME_H, None, prev)
+    assert rect is not None
+    # raw size would be ~1.8*diag (~600px); limiter caps growth to 1.25x
+    assert rect[2] <= 1.25 * 200 + 1
+
+
+def test_center_jump_limited():
+    pts = _vertical_hand()  # bbox center ~ (475, 580)
+    prev = [900, 900, 200, 200, 0.0]  # far away
+    rect, _ = rect_from_landmarks(pts, FRAME_W, FRAME_H, None, prev)
+    assert rect is not None
+    dx = rect[0] - prev[0]
+    dy = rect[1] - prev[1]
+    dist = hypot(dx, dy)
+    assert dist <= 0.6 * 200 + 1  # center pulled to the jump limit
 
 
 def test_rotation_roundtrip():
