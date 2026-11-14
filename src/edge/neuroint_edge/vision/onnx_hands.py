@@ -156,7 +156,7 @@ class OnnxHands:
         # --- stage 1: palm detection ---
         palm_hw_w, palm_hw_h = self._palm_hw[1], self._palm_hw[0]
         padded, _ = _keep_aspect_resize_and_pad(frame_bgr, palm_hw_w, palm_hw_h)
-        pad_half_h = max(0, (palm_hw_h - padded.shape[0]) // 2)  # 0 for landscape
+        max(0, (palm_hw_h - padded.shape[0]) // 2)  # 0 for landscape
         blob = padded / 255.0
         blob = blob[..., ::-1].transpose(2, 0, 1)[None].astype(np.float32)
         boxes = self._palm.run(self._palm_out, {self._palm_input: blob})[0]
@@ -231,7 +231,7 @@ class OnnxHands:
             if self._smoothing is None or self._smooth_time is None:
                 self._smoothing = [PointFilter2D(min_cutoff=1.2, beta=0.03) for _ in range(21)]
                 self._smooth_time = now_s
-            dt = max(now_s - self._smooth_time, 1e-3)
+            max(now_s - self._smooth_time, 1e-3)
             self._smooth_time = now_s
             points = []
             for i, (x, y) in enumerate(xy):
