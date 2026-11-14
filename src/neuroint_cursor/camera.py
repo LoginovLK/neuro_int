@@ -7,11 +7,16 @@ Proven facts baked in (confirmed by research):
 - MJPG fourcc enables 30fps at 720p (default YUY2 caps far lower on many
   webcams).
 - BUFFERSIZE=1 where the backend honors it.
-- read() returns (frame, seq): seq counts UNIQUE frames only — DShow
-  hands out duplicates between real frames, and a strided-byte signature
-  tells them apart.
-- a frozen USB camera hands back the same frame at loop speed; the drain
-  detects that and soft-reopens the capture.
+- With a single blocking reader (this drain thread), cap.read() paces at
+  the camera cadence: every successful read IS a new camera frame, so
+  seq simply counts reads. NO frame-signature dedup — a strided-byte
+  signature cannot tell "camera delivered the same frame again" apart
+  from "the scene barely changed", and on slow/small hand motion it
+  classified real frames as duplicates, tripped the duplicate watchdog
+  and reopened the camera (the "freezes every few seconds" bug).
+- A dead camera (read() failures) is reopened by the watchdog; a
+  physically wedged USB device needs a cable replug (pnputil restart
+  escalates for cases it can fix).
 - read() never resets to None: repeated delivery is harmless, a dropped
   frame stalls fps (old lesson).
 """
@@ -31,6 +36,9 @@ logger = logging.getLogger(__name__)
 # Fixed absolute paths, no shell: public-repo hygiene (bandit S603/S607).
 _PNPUTIL = r"C:\Windows\System32\pnputil.exe"
 _POWERSHELL = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+
+# Consecutive failed reads before the watchdog reopens the capture.
+FAIL_LIMIT = 30
 
 
 class Camera:
@@ -77,46 +85,29 @@ class Camera:
         raise last_err
 
     def _drain(self) -> None:
-        prev_sig: bytes | None = None
-        dup_fast = 0
-        last_t = time.monotonic()
+        fail = 0
         while not self._stop.is_set():
             try:
                 ok, frame = self._cap.read()
             except Exception:  # noqa: BLE001 - driver hiccups must not kill the drain
                 ok, frame = False, None
             if ok and frame is not None:
+                fail = 0
                 if self._mirror:
                     frame = cv2.flip(frame, 1)
-                # DShow read() hands out DUPLICATES between real frames; a
-                # cheap strided signature separates them (seq must count
-                # unique frames, or the loop re-runs inference on the same
-                # image and the fps counter lies).
-                sig = frame[::16, ::16].tobytes()
-                new_frame = sig != prev_sig
-                prev_sig = sig
-                # A frozen camera hands back the same frame at loop speed
-                # (duplicates every few ms) — soft-reopen the capture.
-                now = time.monotonic()
-                if not new_frame and now - last_t < 0.005:
-                    dup_fast += 1
-                    if dup_fast >= 20:
-                        dup_fast = 0
-                        self._escalate(now)
-                        prev_sig = None
-                else:
-                    dup_fast = 0
-                last_t = now
                 with self._lock:
                     self._latest = frame
-                    if new_frame:
-                        self._seq += 1
+                    self._seq += 1
             else:
+                fail += 1
+                if fail >= FAIL_LIMIT:
+                    fail = 0
+                    self._escalate(time.monotonic())
                 self._stop.wait(0.05)
 
     def _escalate(self, now: float) -> None:
-        """Frozen camera: soft reopen; if it keeps dying, restart the USB device."""
-        logger.warning("camera frozen (duplicate frames) — reopening capture")
+        """Dead camera: soft reopen; if it keeps dying, restart the USB device."""
+        logger.warning("camera dead (read failures) — reopening capture")
         self._reopen()
         self._reopen_times.append(now)
         while self._reopen_times and self._reopen_times[0] < now - 30.0:
@@ -171,7 +162,7 @@ class Camera:
         return None
 
     def _reopen(self) -> None:
-        logger.warning("camera frozen (duplicate frames) — reopening capture")
+        logger.warning("camera dead (read failures) — reopening capture")
         try:
             self._cap.release()
         except Exception as exc:  # release must not kill the drain
@@ -181,7 +172,7 @@ class Camera:
                 self._index, self._width, self._height, self._fps, self._open_retries
             )
             logger.info("camera reopened")
-        except Exception as exc:  # next reads retry via the dup watchdog
+        except Exception as exc:  # next reads retry via the fail watchdog
             logger.error("camera reopen failed: %s", exc)
 
     def read(self) -> tuple[object | None, int]:

@@ -30,7 +30,6 @@ class Settings:
     debounce_off_frames: int = 10
     tracking: bool = True
     clahe: bool = True
-    template_tracking: bool = True
     debug_window: bool = True
 
     @classmethod
