@@ -19,8 +19,9 @@ TRACK_SIZE_FACTOR = 1.8
 TRACK_MISS_LIMIT = 10
 # A real hand scores 0.6-0.95 on the landmark head; a tracked false
 # positive (face, keyboard edges) usually scores lower. Holding a track
-# needs the higher bar, so junk tracks die quickly and palm re-acquires.
-TRACK_SCORE_MIN = 0.4
+# needs a higher bar than acquisition, but motion blur dips real scores
+# too — the garbage gates cover the rest.
+TRACK_SCORE_MIN = 0.3
 # Palm sees nothing anywhere while a track lives -> phantom track, dies
 # after this many consecutive empty palm frames.
 TRACK_EMPTY_PALM_LIMIT = 2

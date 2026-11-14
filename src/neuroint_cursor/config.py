@@ -22,11 +22,11 @@ class Settings:
     fps: int = 30
     mirror: bool = True
     sensitivity: float = 1.0
-    min_cutoff: float = 1.2
+    min_cutoff: float = 2.0
     beta: float = 0.01
     palm_score_threshold: float = 0.4
     landmark_score_threshold: float = 0.25
-    debounce_frames: int = 3
+    debounce_frames: int = 2
     debounce_off_frames: int = 10
     tracking: bool = True
     clahe: bool = True

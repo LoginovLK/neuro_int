@@ -75,9 +75,13 @@ NEAR_FACTOR = 1.5
 # ...and it only takes over when it beats the track by this margin
 # (a different hand must be clearly better, not noise-level better).
 SWITCH_MARGIN = 0.15
-# Velocity extrapolation caps.
+# Velocity extrapolation: conservative on purpose — an EMA velocity lags
+# behind direction changes, and a confident wrong prediction oscillates
+# the crop around the hand (the "glitchy jerk" on sharp direction flips).
 VEL_MAX_PX_S = 3000.0
-VEL_PREDICT_MAX_S = 0.15
+VEL_PREDICT_MAX_S = 0.08
+VEL_PREDICT_FACTOR = 0.6
+VEL_EMA_NEW = 0.7         # weight of the fresh velocity sample
 
 # Static-object rejection: shelf junk / furniture edges get detected as a
 # palm and then tracked forever. A real hand always micro-sways, and a
@@ -376,10 +380,16 @@ class OnnxHands:
                 if self._vel is not None and self._last_t is not None:
                     dt = min(max(now_s - self._last_t, 1e-3), VEL_PREDICT_MAX_S)
                     rect[0] += int(
-                        max(min(self._vel[0] * dt, 0.25 * image_w), -0.25 * image_w)
+                        max(
+                            min(self._vel[0] * VEL_PREDICT_FACTOR * dt, 0.25 * image_w),
+                            -0.25 * image_w,
+                        )
                     )
                     rect[1] += int(
-                        max(min(self._vel[1] * dt, 0.25 * image_h), -0.25 * image_h)
+                        max(
+                            min(self._vel[1] * VEL_PREDICT_FACTOR * dt, 0.25 * image_h),
+                            -0.25 * image_h,
+                        )
                     )
                 out = self._landmark_from_rect(frame_bgr, rect, min_score=TRACK_SCORE_MIN)
                 if out is not None and self._on_crop(out[0], rect, image_w, image_h):
@@ -396,7 +406,10 @@ class OnnxHands:
         palm_rects = self._palm_rects(frame_bgr, palm_thr)
         palm_cands: list[tuple[tuple[list[tuple[float, float]], str, float], list[float]]] = []
         for rect in palm_rects:
-            if quarantining and hypot(rect[0] - qx, rect[1] - qy) <= qrad:
+            # A big palm box is a close real hand — never quarantine-block it
+            # (junk blobs are small; the hand at working distance is large).
+            big_hand = rect[2] > 0.18 * image_w
+            if quarantining and not big_hand and hypot(rect[0] - qx, rect[1] - qy) <= qrad:
                 continue
             out = self._landmark_from_rect(frame_bgr, rect)
             if out is not None:
@@ -408,9 +421,15 @@ class OnnxHands:
         source: str | None = None
         if track_alive and track_out is not None:
             chosen, chosen_rect, source = track_out, track_rect, "track"
+            track_pointing = is_pointing(track_out[0])
             for out, rect in palm_cands:
                 d = hypot(rect[0] - track_rect[0], rect[1] - track_rect[1])
-                if d > NEAR_FACTOR * track_rect[2] and out[2] > track_out[2] + SWITCH_MARGIN:
+                # a far candidate takes over when it is clearly better OR
+                # when it points and the track does not (a pointing hand
+                # must always beat a non-pointing phantom)
+                better = out[2] > track_out[2] + SWITCH_MARGIN
+                takeover = is_pointing(out[0]) and not track_pointing
+                if d > NEAR_FACTOR * track_rect[2] and (better or takeover):
                     chosen, chosen_rect, source = out, rect, "switch"
                     break
         elif track_alive and self._prev_rect is not None:
@@ -435,9 +454,11 @@ class OnnxHands:
             if source in ("switch", "init"):
                 self.reset_smoothing()  # a different hand: no history to keep
             self._last_source = source
-            # One Euro on the winner only — one update per landmark per frame.
+            # One Euro on the winner only — one update per landmark per
+            # frame. Light touch: the screen-level filter does the main
+            # smoothing, double-heavy filtering reads as sluggish lag.
             if self._filters is None:
-                self._filters = [PointFilter2D(min_cutoff=0.7, beta=0.015) for _ in range(21)]
+                self._filters = [PointFilter2D(min_cutoff=1.0, beta=0.02) for _ in range(21)]
             points = [
                 (float(sx), float(sy))
                 for sx, sy in (
@@ -463,7 +484,10 @@ class OnnxHands:
                 if self._vel is None:
                     self._vel = (nvx, nvy)
                 else:
-                    self._vel = (0.5 * self._vel[0] + 0.5 * nvx, 0.5 * self._vel[1] + 0.5 * nvy)
+                    self._vel = (
+                        (1.0 - VEL_EMA_NEW) * self._vel[0] + VEL_EMA_NEW * nvx,
+                        (1.0 - VEL_EMA_NEW) * self._vel[1] + VEL_EMA_NEW * nvy,
+                    )
             self._last_center = c
             self._last_t = now_s
 
