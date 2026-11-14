@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>neuro_int — gesture control</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">⬢</span>
+      <div class="brand-text">
+        <h1>neuro_int</h1>
+        <span class="sub">gesture control</span>
+      </div>
+    </div>
+    <div class="badges">
+      <span class="badge badge-cursor hidden" id="badge-cursor">● cursor</span>
+      <span class="badge badge-paused hidden" id="badge-paused">paused</span>
+      <button class="btn btn-ghost" id="pause-btn">Pause</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="viewport">
+      <div class="video-wrap">
+        <img id="video" src="/video" alt="camera stream">
+        <div class="pose-badge" id="pose-badge">no hand</div>
+        <div class="cursor-banner hidden" id="cursor-banner">
+          pinch = steer · quick regrip = click · open palm = exit
+        </div>
+      </div>
+      <div class="metrics">
+        <div class="metric">
+          <span class="metric-value" id="m-fps">—</span>
+          <span class="metric-label">fps</span>
+        </div>
+        <div class="metric">
+          <span class="metric-value" id="m-hands">0</span>
+          <span class="metric-label">hands</span>
+        </div>
+        <div class="metric">
+          <span class="metric-value" id="m-state">idle</span>
+          <span class="metric-label">state</span>
+        </div>
+        <div class="metric">
+          <span class="metric-value" id="m-pose">—</span>
+          <span class="metric-label">pose</span>
+        </div>
+      </div>
+    </section>
+
+    <aside class="panel">
+      <section class="card">
+        <h2>Cursor control</h2>
+        <div class="segmented" id="mode-switch">
+          <button data-mode="relative" class="active">Relative</button>
+          <button data-mode="absolute">Absolute</button>
+        </div>
+        <p class="hint" id="mode-hint">
+          Relative: fingertip deltas steer the mouse, the hand stays near the
+          frame center. Absolute: fingertip position = cursor position.
+        </p>
+        <div class="slider-row">
+          <span class="slider-label">Sensitivity</span>
+          <input type="range" id="sens-slider" min="0.5" max="6" step="0.1" value="2">
+          <span class="slider-value" id="sens-value">2.0×</span>
+        </div>
+        <div class="presets">
+          <button class="btn btn-ghost" data-sens="1.0">Slow</button>
+          <button class="btn btn-ghost" data-sens="2.0">Normal</button>
+          <button class="btn btn-ghost" data-sens="3.5">Fast</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Gesture map</h2>
+        <div id="rules-list" class="rule-list"></div>
+        <form id="add-rule-form" autocomplete="off">
+          <div class="row">
+            <label>Pose
+              <select id="pose-select"></select>
+            </label>
+            <label>Motion
+              <select id="motion-select"></select>
+            </label>
+          </div>
+          <div class="row">
+            <label>Action
+              <select id="action-select"></select>
+            </label>
+            <button class="btn btn-primary" type="submit">Add</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="card">
+        <h2>Custom combos</h2>
+        <div id="custom-list" class="custom-list"></div>
+        <div class="row">
+          <button class="btn btn-accent" id="record-btn">● Record combo</button>
+          <span id="record-status" class="hint"></span>
+        </div>
+        <p class="hint">Global hook: press any shortcut anywhere.</p>
+      </section>
+
+      <details class="card collapsible">
+        <summary>Actions (whitelist)</summary>
+        <div id="actions-list" class="action-list"></div>
+      </details>
+    </aside>
+  </main>
+
+  <div id="toasts"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

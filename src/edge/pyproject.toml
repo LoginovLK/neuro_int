@@ -1,0 +1,34 @@
+[project]
+name = "neuroint-edge"
+version = "0.1.0"
+description = "Host-side agent: camera capture -> brain -> keyboard actuation"
+requires-python = ">=3.11"
+dependencies = [
+    "neuroint-protocol",
+    # contrib build: includes dnn_superres.
+    "opencv-contrib-python>=4.9",
+    "numpy>=1.26",
+    # GPU hand detection (DirectML works on any Windows GPU, no CUDA setup).
+    "onnxruntime-directml>=1.17",
+    "websockets>=12.0",
+    "aiohttp>=3.9",
+    "pynput>=1.7.6",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+]
+
+[project.optional-dependencies]
+# PS3 Eye capture (libusb). Requires MSVC build tools to compile.
+# Pillow + h5py: pseyepy imports both but forgets to declare them.
+pseye = [
+    "pseyepy @ git+https://github.com/bensondaled/pseyepy.git",
+    "pillow>=10.0",
+    "h5py>=3.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["neuroint_edge*"]
