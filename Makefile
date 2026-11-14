@@ -26,9 +26,16 @@ down: ## Stop everything: edge agent + brain container
 build: ## Build the brain image (cached layers, uv cache mounts)
 	@timeout 600 docker compose build
 
-up: install-edge edge-start ## Start everything: brain container (wait healthy) + edge agent in background
+up: install-edge edge-start ## Start everything and WAIT until edge (model + UI) is fully up
 	docker compose up -d --wait
 	@echo ">> brain healthy on 127.0.0.1:$${NEUROINT_WS_PORT:-8765}"
+	@echo ">> waiting for edge agent (model load + UI)..."
+	@ok=0; for i in $$(seq 1 90); do \
+	  code=$$(curl -s --noproxy '*' -o /dev/null -w '%{http_code}' --max-time 2 http://127.0.0.1:$${NEUROINT_UI_PORT:-8756}/ 2>/dev/null); \
+	  if [ "$$code" = "200" ]; then ok=1; echo ">> edge ready (model loaded, UI up)"; break; fi; \
+	  sleep 1; \
+	done; \
+	if [ "$$ok" != "1" ]; then echo ">> edge did not come up in 90s — check make logs"; exit 1; fi
 
 install-edge: ## Create edge venv and install agent (+pseyepy, +neural super-res) on first run; refresh extras later
 	@if [ ! -f "$(VENV_PY)" ]; then \

@@ -16,6 +16,7 @@ import time
 from neuroint_edge import __version__
 from neuroint_edge.capture import create_capture
 from neuroint_edge.capture.quality import FrameEnhancer
+from neuroint_edge.capture.reader import LatestFrameSource
 from neuroint_edge.client import EdgeClient
 from neuroint_edge.config import settings
 from neuroint_edge.gesture_store import GestureStore
@@ -49,7 +50,7 @@ def _open_capture(logger: logging.Logger):
         try:
             source = create_capture(settings)
             logger.info("capture backend ready (%s) on attempt %d", source.name, attempt)
-            return source
+            return LatestFrameSource(source)
         except Exception as exc:  # noqa: BLE001 - driver level failures happen
             logger.warning("camera open failed (attempt %d/5): %s", attempt, exc)
             if attempt == 3:
