@@ -229,7 +229,7 @@ class OnnxHands:
             # without adding noticeable latency to fast movement.
             now_s = time.monotonic()
             if self._smoothing is None or self._smooth_time is None:
-                self._smoothing = [PointFilter2D(min_cutoff=1.2, beta=0.03) for _ in range(21)]
+                self._smoothing = [PointFilter2D(min_cutoff=0.7, beta=0.015) for _ in range(21)]
                 self._smooth_time = now_s
             max(now_s - self._smooth_time, 1e-3)
             self._smooth_time = now_s
