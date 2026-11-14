@@ -52,6 +52,7 @@ def main() -> int:
         class_score_threshold=cfg.landmark_score_threshold,
         tracking=cfg.tracking,
         clahe=cfg.clahe,
+        template=cfg.template_tracking,
     )
     act = CursorActuator(cfg.sensitivity, cfg.min_cutoff, cfg.beta)
     logger.info(

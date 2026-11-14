@@ -50,6 +50,7 @@ import onnxruntime as ort
 
 from neuroint_cursor.pose import is_pointing
 from neuroint_cursor.smoothing import PointFilter2D
+from neuroint_cursor.tracker import HandTemplateTracker
 from neuroint_cursor.tracking import (
     TRACK_EMPTY_PALM_LIMIT,
     TRACK_MISS_LIMIT,
@@ -110,6 +111,16 @@ SIZE_WINDOW_SECONDS = 1.5
 SIZE_GROW_MAX = 1.3       # vs the largest size seen in the window
 SIZE_SHRINK_MIN = 0.8     # vs the smallest size seen in the window
 SIZE_ABS_MAX = 0.5        # fraction of min(frame_w, frame_h)
+
+# Template tracking (Lev's architecture): once the hand points, its 21
+# landmarks are FROZEN as a shape and only translated per frame by phase
+# correlation (~0.5ms, no CNN, zero landmark jitter). The landmark model
+# re-fits on triggers only: every REFIT_EVERY frames (drift) or right
+# away when the correlation drops (pose change / blur / occlusion).
+# Pose acquisition stays on the full pipeline so engage is instant.
+TEMPLATE_START_SCORE = 0.55
+TEMPLATE_MIN_RESPONSE = 0.12
+REFIT_EVERY = 8
 
 
 def _keep_aspect_resize_and_pad(
@@ -187,6 +198,7 @@ class OnnxHands:
         class_score_threshold: float = 0.25,
         tracking: bool = True,
         clahe: bool = True,
+        template: bool = True,
     ) -> None:
         options = ort.SessionOptions()
         options.log_severity_level = 3
@@ -225,6 +237,8 @@ class OnnxHands:
         self._last_center: tuple[float, float] | None = None
         self._last_t: float | None = None
         self._np_run = 0
+        self._template = template
+        self._tpl: HandTemplateTracker | None = None
 
     def _drop_track(self) -> None:
         self._prev_points_norm = None
@@ -236,6 +250,7 @@ class OnnxHands:
         self._np_run = 0
         self._miss = 0
         self._empty_palms = 0
+        self._tpl = None
         self.reset_smoothing()
 
     def reset_smoothing(self) -> None:
@@ -374,6 +389,72 @@ class OnnxHands:
         """Effective score: pointing candidates outscore equal raw anchors."""
         return out[2] + (POINTING_BONUS if is_pointing(out[0]) else 0.0)
 
+    def _smooth(
+        self, raw_points: list[tuple[float, float]], now_s: float
+    ) -> list[tuple[float, float]]:
+        """Winner-level One Euro — one update per landmark per frame."""
+        if self._filters is None:
+            self._filters = [PointFilter2D(min_cutoff=1.0, beta=0.02) for _ in range(21)]
+        return [
+            (float(sx), float(sy))
+            for sx, sy in (
+                self._filters[i].filter(x, y, now_s)
+                for i, (x, y) in enumerate(raw_points)
+            )
+        ]
+
+    def _update_velocity(self, center: tuple[float, float], now_s: float) -> None:
+        if self._last_center is not None and self._last_t is not None:
+            dt = max(now_s - self._last_t, 1e-3)
+            nvx = (center[0] - self._last_center[0]) / dt
+            nvy = (center[1] - self._last_center[1]) / dt
+            nvx = max(min(nvx, VEL_MAX_PX_S), -VEL_MAX_PX_S)
+            nvy = max(min(nvy, VEL_MAX_PX_S), -VEL_MAX_PX_S)
+            if self._vel is None:
+                self._vel = (nvx, nvy)
+            else:
+                self._vel = (
+                    (1.0 - VEL_EMA_NEW) * self._vel[0] + VEL_EMA_NEW * nvx,
+                    (1.0 - VEL_EMA_NEW) * self._vel[1] + VEL_EMA_NEW * nvy,
+                )
+        self._last_center = center
+        self._last_t = now_s
+
+    def _static_check(
+        self,
+        points: list[tuple[float, float]],
+        center: tuple[float, float],
+        now_s: float,
+        image_w: int,
+        image_h: int,
+    ) -> bool:
+        """True when the object was just quarantined (still, never pointing)."""
+        self._hist.append((now_s, center[0], center[1]))
+        horizon = now_s - STATIC_SECONDS
+        while self._hist and self._hist[0][0] < horizon:
+            self._hist.popleft()
+        if (
+            len(self._hist) >= 15
+            and self._hist[-1][0] - self._hist[0][0] >= STATIC_SECONDS * 0.8
+            and not is_pointing(points)
+        ):
+            cxs = [c for _, c, _ in self._hist]
+            cys = [c for _, _, c in self._hist]
+            spread = hypot(max(cxs) - min(cxs), max(cys) - min(cys))
+            if spread <= STATIC_SPREAD * min(image_w, image_h):
+                self._excl_at = (cxs[-1] / image_w, cys[-1] / image_h)
+                self._excl_until = now_s + QUARANTINE_SECONDS
+                self._hist.clear()
+                self._drop_track()
+                logger.info(
+                    "static object at (%.2f, %.2f) quarantined %.0fs",
+                    self._excl_at[0],
+                    self._excl_at[1],
+                    QUARANTINE_SECONDS,
+                )
+                return True
+        return False
+
     def detect(
         self, frame_bgr: np.ndarray, prefer_pointing: bool = False
     ) -> list[tuple[list[tuple[float, float]], str, float]]:
@@ -385,6 +466,27 @@ class OnnxHands:
         """
         image_h, image_w = frame_bgr.shape[:2]
         now_s = time.monotonic()
+
+        # --- template fast path: frozen pointing pose, translation only ---
+        if self._template and self._tpl is not None and self._tpl.active:
+            if self._tpl.age < REFIT_EVERY:
+                frame_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+                res = self._tpl.update(frame_gray)
+                if res is None:
+                    # correlation dropped: pose change, blur, occlusion, edge
+                    self._tpl = None  # fall through to the full pipeline
+                else:
+                    raw_points, handed, score, center = res
+                    points = self._smooth(raw_points, now_s)
+                    self._prev_points_norm = points
+                    if self._prev_rect is not None:
+                        self._prev_rect[0] = int(round(center[0]))
+                        self._prev_rect[1] = int(round(center[1]))
+                    self._update_velocity(center, now_s)
+                    if self._static_check(points, center, now_s, image_w, image_h):
+                        return []
+                    return [(points, handed, score)]
+            # else: sync frame — the full pipeline below re-fits the template
 
         # --- tracked candidate: ROI = previous landmarks + velocity ---
         track_out: tuple[list[tuple[float, float]], str, float] | None = None
@@ -500,67 +602,40 @@ class OnnxHands:
             # One Euro on the winner only — one update per landmark per
             # frame. Light touch: the screen-level filter does the main
             # smoothing, double-heavy filtering reads as sluggish lag.
-            if self._filters is None:
-                self._filters = [PointFilter2D(min_cutoff=1.0, beta=0.02) for _ in range(21)]
-            points = [
-                (float(sx), float(sy))
-                for sx, sy in (
-                    self._filters[i].filter(x, y, now_s)
-                    for i, (x, y) in enumerate(chosen[0])
-                )
-            ]
+            points = self._smooth(chosen[0], now_s)
             self._prev_points_norm = points
             if chosen_rect is None:
                 chosen_rect, _ = rect_from_landmarks(
                     points, image_w, image_h, self._prev_dir, None
                 )
             self._prev_rect = chosen_rect
-
-            # velocity for ROI extrapolation (bridges fast swipes)
-            c = (chosen_rect[0], chosen_rect[1])
-            if self._last_center is not None and self._last_t is not None:
-                dt = max(now_s - self._last_t, 1e-3)
-                nvx = (c[0] - self._last_center[0]) / dt
-                nvy = (c[1] - self._last_center[1]) / dt
-                nvx = max(min(nvx, VEL_MAX_PX_S), -VEL_MAX_PX_S)
-                nvy = max(min(nvy, VEL_MAX_PX_S), -VEL_MAX_PX_S)
-                if self._vel is None:
-                    self._vel = (nvx, nvy)
-                else:
-                    self._vel = (
-                        (1.0 - VEL_EMA_NEW) * self._vel[0] + VEL_EMA_NEW * nvx,
-                        (1.0 - VEL_EMA_NEW) * self._vel[1] + VEL_EMA_NEW * nvy,
-                    )
-            self._last_center = c
-            self._last_t = now_s
+            self._update_velocity((chosen_rect[0], chosen_rect[1]), now_s)
 
             results = [(points, chosen[1], chosen[2])]
 
+            # --- template capture: only a confident POINTING hand ---
+            if self._template:
+                if is_pointing(points) and chosen[2] >= TEMPLATE_START_SCORE:
+                    if self._tpl is None:
+                        self._tpl = HandTemplateTracker(min_response=TEMPLATE_MIN_RESPONSE)
+                    frame_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+                    if not self._tpl.capture(
+                        frame_gray,
+                        (chosen_rect[0], chosen_rect[1]),
+                        chosen_rect[2],
+                        points,
+                        chosen[1],
+                        chosen[2],
+                    ):
+                        self._tpl = None
+                elif self._tpl is not None:
+                    self._tpl = None  # pose no longer points: full pipeline
+
             # --- static-object rejection (see constants above) ---
-            self._hist.append((now_s, chosen_rect[0], chosen_rect[1]))
-            horizon = now_s - STATIC_SECONDS
-            while self._hist and self._hist[0][0] < horizon:
-                self._hist.popleft()
-            if (
-                len(self._hist) >= 15
-                and self._hist[-1][0] - self._hist[0][0] >= STATIC_SECONDS * 0.8
-                and not is_pointing(points)
+            if self._static_check(
+                points, (chosen_rect[0], chosen_rect[1]), now_s, image_w, image_h
             ):
-                cxs = [c for _, c, _ in self._hist]
-                cys = [c for _, _, c in self._hist]
-                spread = hypot(max(cxs) - min(cxs), max(cys) - min(cys))
-                if spread <= STATIC_SPREAD * min(image_w, image_h):
-                    self._excl_at = (cxs[-1] / image_w, cys[-1] / image_h)
-                    self._excl_until = now_s + QUARANTINE_SECONDS
-                    self._hist.clear()
-                    self._drop_track()
-                    results = []
-                    logger.info(
-                        "static object at (%.2f, %.2f) quarantined %.0fs",
-                        self._excl_at[0],
-                        self._excl_at[1],
-                        QUARANTINE_SECONDS,
-                    )
+                results = []
         else:
             self._miss += 1
             if self._miss > TRACK_MISS_LIMIT:
