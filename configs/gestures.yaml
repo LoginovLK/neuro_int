@@ -1,0 +1,29 @@
+# Gesture -> action mapping. Managed by the neuro_int UI.
+#
+# Manual edits are fine too: apply them with `make restart-config` or from
+# the UI. Format:
+#   rules: [{pose, direction|hold, action}, ...]
+#   custom_actions: [{id, keys, description}, ...]
+rules:
+- pose: index_up
+  direction: right
+  action: alt_tab
+- pose: index_up
+  direction: left
+  action: alt_shift_tab
+- pose: two_up
+  direction: right
+  action: desktop_right
+- pose: two_up
+  direction: left
+  action: desktop_left
+- pose: open_palm
+  hold: true
+  action: pause_system
+- pose: pinch
+  hold: true
+  action: left_click
+- pose: index_up
+  direction: left
+  action: alt_tab
+custom_actions: []
