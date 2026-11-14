@@ -64,16 +64,16 @@ def finger_states(pts: list[tuple[float, float]]) -> dict[str, bool]:
 
 
 def is_pointing(pts: list[tuple[float, float]]) -> bool:
-    """The pointing pose, tolerant of mid-motion sloppiness.
+    """The pointing pose: index straight, middle folded.
 
-    Index must be straight and the middle finger folded (that alone
-    separates ☝ from ✌ and the open palm). Ring/pinky may read sloppy
-    while the hand moves — only BOTH extended counts as palm-like.
+    Middle alone separates ☝ from ✌ and the open palm. Ring/pinky are
+    NOT checked: on a hand seen edge-on (knuckles toward the camera, the
+    dark-hoodie case) they misread as extended — the face false
+    positives that motivated the strict rule are already rejected by the
+    palm-cluster filter before this check runs.
     """
     state = finger_states(pts)
-    if not state["index"] or state["middle"]:
-        return False
-    return not (state["ring"] and state["pinky"])
+    return state["index"] and not state["middle"]
 
 
 def palm_ratio(pts: list[tuple[float, float]]) -> float | None:

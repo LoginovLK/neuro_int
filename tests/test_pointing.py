@@ -91,7 +91,7 @@ def test_fist_is_not_pointing():
 
 
 def test_sloppy_ring_is_still_pointing():
-    """Mid-motion one of ring/pinky may read extended — still pointing."""
+    """Mid-motion ring/pinky may read extended — still pointing."""
     pts = _hand(
         _straight_finger(0.47, 0.70),
         _curled_finger(0.52, 0.68),
@@ -101,12 +101,25 @@ def test_sloppy_ring_is_still_pointing():
     assert is_pointing(pts)
 
 
-def test_sloppy_ring_and_pinky_is_palm_like():
+def test_sloppy_ring_and_pinky_still_pointing():
+    """Edge-on hands (knuckles to camera) misread ring/pinky as extended;
+    middle folded is what keeps ☝ distinct from ✌ and the palm."""
     pts = _hand(
         _straight_finger(0.47, 0.70),
         _curled_finger(0.52, 0.68),
         _straight_finger(0.56, 0.70),
         _straight_finger(0.60, 0.72),
+    )
+    assert is_pointing(pts)
+
+
+def test_peace_is_not_pointing():
+    """index + middle up is ✌, not ☝."""
+    pts = _hand(
+        _straight_finger(0.47, 0.70),
+        _straight_finger(0.52, 0.68),
+        _curled_finger(0.56, 0.70),
+        _curled_finger(0.60, 0.72),
     )
     assert not is_pointing(pts)
 
