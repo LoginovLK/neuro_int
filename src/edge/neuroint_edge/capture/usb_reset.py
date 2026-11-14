@@ -43,7 +43,7 @@ def restart_camera_devices() -> bool:
         try:
             # instance_id comes from Get-PnpDevice itself, never from input.
             subprocess.run(  # noqa: S603
-                ["pnputil", "/restart-device", instance_id],
+                [_PNPUTIL, "/restart-device", instance_id],
                 capture_output=True,
                 text=True,
                 timeout=30,
