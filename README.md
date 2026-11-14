@@ -1,102 +1,59 @@
-# neuro_int
+# neuro_int — курсор по указательному пальцу
 
-Gesture-controlled system automation through a camera. Show a pose, swipe,
-the machine obeys. v1 runs on a **PS3 Eye** camera (libusb) with a graceful
-fallback to any regular webcam.
+Поднимаешь ☝ — курсор на ПК едет туда, куда указывает палец. Опускаешь (или
+убираешь руку) — курсор замирает. Всё. Остальной функционал (жесты, клики,
+клавиши, docker-стек, веб-UI) удалён.
 
-```
-┌─────────────── host (Windows) ───────────────┐   ┌─── docker ───┐
-│  PS3 Eye ──> edge agent ──JPEG frames──>  brain: MediaPipe HandLandmarker
-│              (capture +    │                │        ↓ gesture FSM
-│               quality)     │                │        ↓ action mapping
-│  keyboard <── edge agent <──commands──      │        ↓ WebSocket    │
-└──────────────────────────────────────────────┘   └───────────────┘
-```
-
-Brain (inference + gesture logic) lives in a container; the edge agent on the
-host owns the camera and the keyboard — Docker cannot reach either.
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
-
-## Gestures
-
-| Gesture | Meaning |
-|---|---|
-| ☝ hold + swipe right/left | Alt+Tab / Alt+Shift+Tab |
-| ✌ hold + swipe left/right | Previous / next virtual desktop |
-| 🖐 hold ~1s | Pause / resume gesture control (kill switch) |
-| 🤏 pinch (hold) | **Cursor mode**: thumb+index steer the mouse; quick release-regrip = left click; open palm exits |
-
-Full dictionary, cursor mode details and extension guide:
-[docs/GESTURES.md](docs/GESTURES.md).
-
-## Live UI
-
-`make run` starts a local dashboard (loopback only):
-
-```
-make run            # edge agent: camera -> brain -> keyboard/mouse
-make ui             # open http://127.0.0.1:8756 in the browser
-```
-
-- **live video with bones**: 21 landmarks + skeleton over the camera feed,
-  current pose, FSM state, cursor steering point
-- **gesture map**: every configured gesture as a card (pose emoji, motion,
-  action, key chips) — with one-click remove
-- **add rules**: pick pose + motion + action, press *Add rule* — applied
-  instantly (no rebuild)
-- **custom combos**: *Record key combo* captures any shortcut with a global
-  keyboard hook (Alt+Tab included) and creates a reusable `custom_N` action
-
-## Quickstart
-
-Prerequisites: Windows 10/11, Docker Desktop, Python 3.12, PS3 Eye plugged in
-with a libusb driver (Zadig) — verify with `Get-CimInstance Win32_PnPEntity |
-Where-Object Name -match 'PS3Eye'`.
+## Запуск
 
 ```bash
-# 1. Host agent (edge): venv + packages, incl. pseyepy compiled from source.
-#    Requires MSVC build tools (VS 2022 Community is fine).
-make install-edge
-
-# 2. Container stack (brain): build, run, wait for health.
-make rebuild
-
-# 3. Protocol smoke test (no camera needed).
-make smoke
-
-# 4. Camera probe: saves sample shots to captures/, prints tuning metrics.
-#    Pick gain/exposure for .env based on brightness / green_cast / sharpness.
-make probe
-
-# 5. Run the edge agent (camera -> brain -> keyboard). Keep the console open.
-make run
+make run        # окно камеры + управление курсором (q — выход)
+make headless   # без окна
+make smoke      # 12с самопроверка камеры/GPU/детекта (мышь не трогает)
+make test       # юнит-тесты
 ```
 
-Copy `.env.example` to `.env` first and tune camera values from the probe.
+Venv `.venv-edge` уже на месте (onnxruntime-directml, opencv, pynput, numpy).
 
-## Commands
+## Настройки
 
-| Target | What it does |
-|---|---|
-| `make rebuild` | Stop → rebuild image → start → wait healthy. Always applies full state. |
-| `make up` / `make down` | Start / stop stack without rebuilding |
-| `make restart-config` | Apply `configs/gestures.yaml` edits without a rebuild |
-| `make logs` / `make ps` | Brain logs / stack status |
-| `make run` / `make run-bg` | Edge agent in foreground / detached |
-| `make test` / `make lint` | Tests / ruff (with security rules) |
-| `make probe` | Camera diagnostics + sample shots |
-| `make smoke` | Wire-protocol round-trip against the running brain |
+`config.json` в корне. Сенса меняется на лету клавишами `+` / `-` в окне
+(шаг 0.2, сохраняется сразу):
 
-## PS3 Eye quality notes
+| ключ | дефолт | что делает |
+|---|---|---|
+| `sensitivity` | 1.0 | размер активной зоны кадра: больше = резче курсор |
+| `min_cutoff` / `beta` | 1.2 / 0.01 | One Euro: плавность против дрожи |
+| `camera_index` | 0 | какая вебка |
+| `mirror` | true | зеркало кадра |
+| `debug_window` | true | окно предпросмотра |
+| `palm_score_threshold` / `landmark_score_threshold` | 0.3 / 0.25 | пороги детекта (0.3/0.25 — дальняя рука) |
 
-The camera's auto mode in dark scenes pushes gain up: heavy noise and a green
-cast. Fixes, in order of impact: **light in front of you** > manual gain/
-exposure (`.env`) > built-in frame enhancement (temporal denoise + CLAHE +
-sharpening). `make probe` shows raw vs enhanced shots so you can see it.
+Активная зона = центральная часть кадра (при сенсе 1.0 — средняя половина по
+ширине и высоте). Палец в центре зоны → курсор в центре экрана; палец в углу
+зоны → курсор в углу экрана. Палец вне зоны — курсор прижат к краю экрана.
 
-## Development
+## Как это работает (4 слоя)
 
-- Packages: `src/protocol` (wire contract), `src/brain` (container), `src/edge` (host agent)
-- Tests run fully offline on synthetic landmarks: `make test`
-- Public repo: read [docs/SECURITY.md](docs/SECURITY.md) before committing —
-  secrets never enter this repository, CI enforces it with gitleaks.
+1. **Захват** (`camera.py`) — `CAP_DSHOW` + MJPG + выделенный drain-поток,
+   который непрерывно осушает камеру и отдаёт только свежайший кадр.
+   Драйвер DShow держит внутреннюю очередь: без drain-потока из неё читаются
+   устаревшие кадры и копится лаг (те самые 2-3с).
+2. **Детект** (`hands.py`) — PINTO-пайплайн как ONNX: palm-детектор с NMS
+   внутри графа (192×192) + landmark-модель (224×224, 21 точка) через
+   `onnxruntime` DirectML на GPU (~4-5мс/кадр).
+3. **Кадры → команда** (`pose.py`, `mapping.py`) — палец считается указательным,
+   когда он прямой (tip дальше от запястья, чем PIP, и изгиб в PIP < 50°),
+   а средний/безымянный/мизинец согнуты. Ладонь или кулак — не считаются.
+   Подтверждение 3 кадра подряд (debounce). Позиция кончика (landmark 8)
+   маппится из активной зоны в экран абсолютно + One Euro сглаживание.
+4. **Команда → ПК** (`cursor.py`) — `pynput` (SetCursorPos под капотом),
+   процесс DPI-aware, чтобы координаты совпадали с физическими пикселями.
+
+## Почему удалено всё остальное
+
+Стек v1 (brain-контейнер, FSM жестов, WebSocket, веб-UI) работал, но курсор
+не двигался по причине, которую не удалось локализовать за сутки. v2 — один
+локальный процесс без сети, без контейнеров, без промежуточных слоёв: меньше
+поверхностей — меньше мест, где сломаться. Proven-куски (drain-reader,
+ONNX-декод с фиксами, One Euro) перенесены дословно.
