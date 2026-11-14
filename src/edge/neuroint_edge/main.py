@@ -11,6 +11,7 @@ import asyncio
 import logging
 import pathlib
 import sys
+import time
 
 from neuroint_edge import __version__
 from neuroint_edge.capture import create_capture
@@ -38,6 +39,28 @@ def _setup_logging() -> logging.Logger:
     return logging.getLogger(__name__)
 
 
+def _open_capture(logger: logging.Logger):
+    """Open the camera with retries and a USB device reset in between.
+
+    A hung USB webcam can refuse to reopen for minutes; failing hard here
+    would take the whole edge down before the UI ever starts.
+    """
+    for attempt in range(1, 6):
+        try:
+            source = create_capture(settings)
+            logger.info("capture backend ready (%s) on attempt %d", source.name, attempt)
+            return source
+        except Exception as exc:  # noqa: BLE001 - driver level failures happen
+            logger.warning("camera open failed (attempt %d/5): %s", attempt, exc)
+            if attempt == 3:
+                from neuroint_edge.capture.usb_reset import restart_camera_devices
+
+                if restart_camera_devices():
+                    logger.info("USB camera devices restarted, retrying")
+            time.sleep(3.0)
+    raise RuntimeError("camera could not be opened after 5 attempts (see logs above)")
+
+
 def main() -> None:
     logger = _setup_logging()
     if sys.platform == "win32":
@@ -46,7 +69,7 @@ def main() -> None:
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     logger.info("neuroint edge %s starting", __version__)
 
-    source = create_capture(settings)
+    source = _open_capture(logger)
     hands_detector = OnnxHands(
         palm_model=settings.vision_onnx_palm,
         landmark_model=settings.vision_onnx_landmark,

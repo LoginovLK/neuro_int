@@ -19,12 +19,12 @@ rebuild: down build up ## Full stack rebuild: down -> build -> up (brain + edge 
 
 down: ## Stop everything: edge agent + brain container
 	@$(MAKE) edge-stop
-	docker compose down --remove-orphans --timeout 10 \
+	@timeout 60 docker compose down --remove-orphans --timeout 10 \
 	|| (docker rm -f $$(docker compose ps -q) 2>/dev/null; echo ">> container force-removed (was stuck)")
 	@echo ">> stack stopped"
 
 build: ## Build the brain image (cached layers, uv cache mounts)
-	docker compose build
+	@timeout 600 docker compose build
 
 up: install-edge edge-start ## Start everything: brain container (wait healthy) + edge agent in background
 	docker compose up -d --wait
@@ -69,7 +69,14 @@ restart-edge: edge-stop edge-start ## Restart only the edge agent (applies edge 
 run: ## Run edge agent in foreground (Ctrl+C stops; for debugging)
 	$(VENV_PY) -m neuroint_edge.main
 
-ui: ## Open the gesture UI (camera + bones + editor) in the browser
+ui: ## Open the gesture UI in the browser (waits until the edge is ready)
+	@echo ">> waiting for edge UI to come up..."
+	@ok=0; for i in $$(seq 1 90); do \
+	  code=$$(curl -s --noproxy '*' -o /dev/null -w '%{http_code}' --max-time 2 http://127.0.0.1:$${NEUROINT_UI_PORT:-8756}/ 2>/dev/null); \
+	  if [ "$$code" = "200" ]; then ok=1; echo ">> UI ready, opening browser"; break; fi; \
+	  sleep 1; \
+	done; \
+	if [ "$$ok" != "1" ]; then echo ">> edge UI did not come up in 90s — check make logs"; exit 1; fi; \
 	cmd //c start "" "http://127.0.0.1:$${NEUROINT_UI_PORT:-8756}"
 
 test: ## Run unit + integration tests
