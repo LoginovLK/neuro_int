@@ -98,7 +98,7 @@ def main() -> int:
                 last_seq = seq
                 now = time.monotonic()
 
-                results = hands.detect(frame, prefer_pointing=active)
+                results = hands.detect(frame, prefer_pointing=active, engaged=active)
                 result = results[0] if results else None
                 if not results:
                     hands.reset_smoothing()

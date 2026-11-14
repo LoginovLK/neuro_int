@@ -403,6 +403,24 @@ class OnnxHands:
         return best
 
     @staticmethod
+    def _spread_ok(
+        points: list[tuple[float, float]],
+        rect: list[float],
+        frame_w: int,
+        frame_h: int,
+    ) -> bool:
+        """The landmark cloud must actually fill its crop (scale-free).
+
+        A collapsed blob spans a fraction of the palm box; a real hand
+        fills most of it (measured 0.6-0.9 on live frames, collapsed
+        templates well below 0.35).
+        """
+        xs = [p[0] * frame_w for p in points]
+        ys = [p[1] * frame_h for p in points]
+        diag = hypot(max(xs) - min(xs), max(ys) - min(ys))
+        return diag >= 0.35 * rect[2]
+
+    @staticmethod
     def _cluster_filter(rects: list[list[float]]) -> list[list[float]]:
         """Drop boxes in crowded clusters (the model fires all over a face)."""
         keep: list[list[float]] = []
@@ -517,13 +535,16 @@ class OnnxHands:
         return False
 
     def detect(
-        self, frame_bgr: np.ndarray, prefer_pointing: bool = False
+        self, frame_bgr: np.ndarray, prefer_pointing: bool = False, engaged: bool = False
     ) -> list[tuple[list[tuple[float, float]], str, float]]:
         """Full frame BGR -> list of (21 normalized landmarks, handedness, score).
 
         prefer_pointing: the cursor is engaged — bridging a missed track
         only accepts pointing candidates (a face anchor at frame center
         must not steal the hand mid-use).
+        engaged: the main loop's debounce confirmed pointing — only then
+        may the template be captured (a single flicker frame must not
+        freeze a garbage pose).
         """
         image_h, image_w = frame_bgr.shape[:2]
         now_s = time.monotonic()
@@ -669,8 +690,20 @@ class OnnxHands:
             results = [(points, chosen[1], chosen[2])]
 
             # --- template capture: only a confident POINTING hand ---
+            # --- template capture/re-validation ---
+            # Capture only when the main loop's debounce CONFIRMED pointing
+            # (engaged), the pose points right now, the score is solid and
+            # the landmark cloud actually fills the crop (a collapsed blob
+            # must never be frozen). A sync frame that fails any of these
+            # kills the template — it never survives on stale references
+            # longer than REFIT_EVERY frames.
             if self._template:
-                if is_pointing(points) and chosen[2] >= TEMPLATE_START_SCORE:
+                if (
+                    engaged
+                    and is_pointing(points)
+                    and chosen[2] >= TEMPLATE_START_SCORE
+                    and self._spread_ok(points, chosen_rect, image_w, image_h)
+                ):
                     if self._tpl is None:
                         self._tpl = HandTemplateTracker(min_response=TEMPLATE_MIN_RESPONSE)
                     frame_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
@@ -684,7 +717,7 @@ class OnnxHands:
                     ):
                         self._tpl = None
                 elif self._tpl is not None:
-                    self._tpl = None  # pose no longer points: full pipeline
+                    self._tpl = None  # sync could not re-validate: full pipeline
 
             # --- static-object rejection (see constants above) ---
             if self._static_check(
