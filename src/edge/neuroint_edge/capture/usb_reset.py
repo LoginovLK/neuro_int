@@ -19,7 +19,8 @@ def restart_camera_devices() -> bool:
     """Restart every present camera-class PnP device. True = something was
     restarted (best effort; requires an elevated process)."""
     try:
-        listing = subprocess.run(
+        # Static command + constant filter, no untrusted input (S603 safe).
+        listing = subprocess.run(  # noqa: S603
             [
                 _POWERSHELL,
                 "-NoProfile",
@@ -40,7 +41,8 @@ def restart_camera_devices() -> bool:
     restarted = False
     for instance_id in [line.strip() for line in listing.stdout.splitlines() if line.strip()]:
         try:
-            subprocess.run(
+            # instance_id comes from Get-PnpDevice itself, never from input.
+            subprocess.run(  # noqa: S603
                 ["pnputil", "/restart-device", instance_id],
                 capture_output=True,
                 text=True,
