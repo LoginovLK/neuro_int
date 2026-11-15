@@ -123,10 +123,12 @@ def main() -> int:
 
                 results = hands.detect(frame, prefer_pinch=active)
                 result = results[0] if results else None
-                if not results:
-                    pass  # filters reset inside the backend on track loss
+                # coast keeps the skeleton visible but is NOT a hand:
+                # control treats stale results as "no hand" so the pinch
+                # releases when the hand leaves the frame
+                fresh = (now - getattr(hands, "_last_fresh", now)) <= 0.10
 
-                pointing = result is not None and is_pinch(result[0])
+                pointing = fresh and result is not None and is_pinch(result[0])
                 # Debounce both edges: ON after a few straight-pointing frames,
                 # OFF only after a grace period (single dropped detections must
                 # not stutter the cursor).

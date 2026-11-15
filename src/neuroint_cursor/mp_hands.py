@@ -94,6 +94,9 @@ class MediaPipeHands:
         self._coast_t = 0.0
         self._bundle_prev: tuple[float, float] | None = None
         self._bundle_vel: tuple[float, float] = (0.0, 0.0)
+        # timestamp of the last REAL detection (coast does not update it):
+        # control logic treats results older than ~0.1s as "no hand"
+        self._last_fresh = 0.0
 
     # ---------------- helpers (carried over) ----------------
 
@@ -326,7 +329,9 @@ class MediaPipeHands:
 
         pinch_now = is_pinch(points)
         if self._sticker_check(points, pinch_now, now_s, image_w, image_h):
+            self._coast = None
             return []
         self._coast = (points, handed, score)
         self._coast_t = now_s
+        self._last_fresh = now_s
         return [(points, handed, score)]
