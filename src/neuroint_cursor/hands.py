@@ -98,7 +98,7 @@ ZONE_LIMIT = 6            # FIFO cap on remembered zones
 # hand. The shape re-freezes only when the live landmark cloud diverges
 # from the rigid model by this fraction of the hand size (the pose
 # actually changed).
-SHAPE_REFIT = 0.35
+SHAPE_REFIT = 0.55
 
 # Still-PINCH sticker: a hallucination that reads pinch forever is
 # exempt from the never-pinch quarantine — and it can even ENGAGE the
@@ -264,6 +264,9 @@ class OnnxHands:
         self._hist: deque[tuple[float, float, float, float]] = deque()
         self._tip_hist: deque[tuple[float, float, float]] = deque()
         self._shape: tuple[list[tuple[float, float]], float] | None = None
+        self._anchor_f: PointFilter2D | None = None
+        self._ang_vec: tuple[float, float] | None = None
+        self._hand_f = 0.0
         self._zones: list[tuple[float, float]] = []
         self._lock: tuple[float, float, float, float, float] | None = None
         self._lock_seen = 0.0
@@ -276,6 +279,8 @@ class OnnxHands:
         self._hist.clear()
         self._tip_hist.clear()
         self._shape = None
+        self._anchor_f = None
+        self._ang_vec = None
         self.reset_smoothing()
 
     def reset_smoothing(self) -> None:
@@ -507,17 +512,21 @@ class OnnxHands:
         ]
 
     def _shape_apply(
-        self, raw: list[tuple[float, float]], image_w: int, image_h: int
+        self, raw: list[tuple[float, float]], now_s: float,
+        image_w: int, image_h: int,
     ) -> list[tuple[float, float]]:
         """Freeze the landmark SHAPE, rigidly re-anchor it every frame.
 
         Lev's architecture: the bones are not re-fit per frame — the
         frozen shape is translated onto the live wrist and rotated/
-        scaled by the live wrist->middle-MCP transform. Only 3 degrees
-        of freedom follow the CNN, so per-landmark jitter is gone and
-        the skeleton cannot slide. Re-freezes only when the live cloud
-        diverges from the rigid model beyond SHAPE_REFIT (the pose
-        actually changed).
+        scaled by the live wrist->middle-MCP transform. The 3 rigidity
+        parameters (wrist, angle, size) are themselves LOW-PASS filtered
+        (wrist: One Euro; angle: direction-vector EMA — a straight angle
+        EMA wraps; size: EMA): with a bundled hand the palm vector is
+        short and its raw angle flickers +-10 degrees per frame, which
+        used to spin the whole skeleton. Re-freezes only when the live
+        cloud diverges from the rigid model beyond SHAPE_REFIT (the
+        pose actually changed).
         """
         px = [(x * image_w, y * image_h) for x, y in raw]
         hand = hypot(px[9][0] - px[0][0], px[9][1] - px[0][1])
@@ -529,13 +538,29 @@ class OnnxHands:
                 [((p[0] - px[0][0]) / hand, (p[1] - px[0][1]) / hand) for p in px],
                 ang,
             )
+            self._anchor_f = PointFilter2D(min_cutoff=1.0, beta=0.02)
+            self._ang_vec = (cos(ang), sin(ang))
+            self._hand_f = hand
             return raw
         offsets, ang0 = self._shape
-        d = normalize_radians(ang - ang0)
+
+        # filtered rigidity parameters
+        fx, fy = self._anchor_f.filter(px[0][0], px[0][1], now_s)
+        vx, vy = self._ang_vec
+        nx, ny = cos(ang), sin(ang)
+        vx, vy = 0.85 * vx + 0.15 * nx, 0.85 * vy + 0.15 * ny
+        norm = hypot(vx, vy)
+        if norm > 1e-6:
+            vx, vy = vx / norm, vy / norm
+        self._ang_vec = (vx, vy)
+        ang_f = atan2(vy, vx)
+        self._hand_f = 0.85 * self._hand_f + 0.15 * hand
+
+        d = normalize_radians(ang_f - ang0)
         ca, sa = cos(d), sin(d)
-        wx, wy = px[0]
         emitted = [
-            (wx + hand * (ox * ca - oy * sa), wy + hand * (ox * sa + oy * ca))
+            (fx + self._hand_f * (ox * ca - oy * sa),
+             fy + self._hand_f * (ox * sa + oy * ca))
             for ox, oy in offsets
         ]
         div = median(
@@ -543,12 +568,13 @@ class OnnxHands:
             for i in range(21)
         ) / hand
         if div > SHAPE_REFIT:
-            # pose change: re-freeze from the live cloud
+            # pose change: re-freeze from the live cloud, keeping the
+            # filtered anchor so the swap is a drift, not a jump
             self._shape = (
                 [((p[0] - px[0][0]) / hand, (p[1] - px[0][1]) / hand) for p in px],
-                ang,
+                ang_f,
             )
-            return raw
+            return [(ex / image_w, ey / image_h) for ex, ey in emitted]
         return [(ex / image_w, ey / image_h) for ex, ey in emitted]
 
     def _track_tip(
@@ -699,7 +725,7 @@ class OnnxHands:
         )
         if best is not None:
             out, rect = best
-            shaped = self._shape_apply(out[0], image_w, image_h)
+            shaped = self._shape_apply(out[0], now_s, image_w, image_h)
             points = self._smooth(shaped, now_s)
             self._prev_points_norm = points
             self._prev_rect = rect
@@ -716,7 +742,7 @@ class OnnxHands:
             if rect is not None:
                 out = self._landmark_tracked(frame_bgr, rect)
                 if out is not None and self._on_crop(out[0], rect, image_w, image_h):
-                    shaped = self._shape_apply(out[0], image_w, image_h)
+                    shaped = self._shape_apply(out[0], now_s, image_w, image_h)
                     points = self._smooth(shaped, now_s)
                     self._prev_points_norm = points
                     self._prev_rect = rect
