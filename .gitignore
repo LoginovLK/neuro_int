@@ -45,3 +45,6 @@ configs/local/
 
 # ---- Models (downloaded separately, up to 350MB) ----
 models/*.onnx
+
+# ---- machine-local settings (personal sensitivity etc) ----
+config.json

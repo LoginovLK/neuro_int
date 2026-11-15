@@ -4,7 +4,7 @@
   "height": 720,
   "fps": 30,
   "mirror": true,
-  "sensitivity": 3.0,
+  "sensitivity": 1.0,
   "min_cutoff": 2.0,
   "beta": 0.01,
   "palm_score_threshold": 0.4,
