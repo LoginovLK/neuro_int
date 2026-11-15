@@ -11,6 +11,7 @@ import argparse
 import json
 import logging
 import logging.handlers
+import queue as queue_mod
 import time
 from pathlib import Path
 
@@ -48,15 +49,18 @@ def main() -> int:
     file_handler = logging.handlers.RotatingFileHandler(
         log_dir / "neuroint.log", maxBytes=2_000_000, backupCount=3, encoding="utf-8"
     )
-    # non-blocking: disk writes go through a background queue - a sync
-    # flush inside the 30fps loop causes periodic cursor freezes
-    queue = logging.handlers.QueueHandler(file_handler)
-    listener = logging.handlers.QueueListener(queue, file_handler, respect_handler_level=False)
+    # non-blocking: records go through a real queue.Queue to a background
+    # thread - a sync disk flush inside the 30fps loop caused freezes
+    log_queue = queue_mod.Queue()
+    queue_handler = logging.handlers.QueueHandler(log_queue)
+    listener = logging.handlers.QueueListener(
+        log_queue, file_handler, respect_handler_level=False
+    )
     listener.start()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
-        handlers=[queue],
+        handlers=[queue_handler],
     )
     args = parse_args()
     cfg = Settings.load()
