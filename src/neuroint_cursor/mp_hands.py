@@ -22,6 +22,8 @@ from statistics import median
 
 import cv2
 import numpy as np
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision
 
 from neuroint_cursor.pose import classify, is_pinch, pinch_center
 from neuroint_cursor.smoothing import PointFilter2D
@@ -59,7 +61,6 @@ class MediaPipeHands:
         clahe: bool = False,
     ) -> None:
         import mediapipe as mp
-        from mediapipe.tasks import python as mp_python
         from mediapipe.tasks.python import vision
 
         options = vision.HandLandmarkerOptions(
@@ -112,6 +113,21 @@ class MediaPipeHands:
         # pinching is locked out until a pinch lands on that spot.
         self._shist: deque[tuple[float, float, float, float, float]] = deque()
         self._slock: tuple[float, float, float, float] | None = None
+        # tracker-latch watchdog: the VIDEO landmarker latches onto
+        # textures and redraws a hand forever; an independent IMAGE-mode
+        # landmarker re-checks the same frame every second, and after two
+        # consecutive "video sees a hand / image sees none" the video
+        # tracker is REBUILT (a track reset it cannot self-recover from)
+        self._vopts = options
+        self._iopts = vision.HandLandmarkerOptions(
+            base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),
+            running_mode=vision.RunningMode.IMAGE,
+            num_hands=2,
+            min_hand_detection_confidence=0.5,
+        )
+        self._img_lm = vision.HandLandmarker.create_from_options(self._iopts)
+        self._last_validate = 0.0
+        self._stale_strikes = 0
 
     # ---------------- helpers (carried over) ----------------
 
@@ -264,6 +280,36 @@ class MediaPipeHands:
         rgb = np.ascontiguousarray(frame_bgr[..., ::-1])
         mp_image = self._mp_image_cls(image_format=self._srgb, data=rgb)
         result = self._landmarker.detect_for_video(mp_image, ts_ms)
+
+        # tracker-latch watchdog (1 Hz): the independent IMAGE detector
+        # re-checks the same frame; after two consecutive "video sees a
+        # hand / image sees none" the VIDEO tracker has latched onto a
+        # texture - rebuild it (the only track reset it cannot do itself)
+        if now_s - self._last_validate >= 1.0:
+            self._last_validate = now_s
+            n_img = len(self._img_lm.detect(mp_image).hand_landmarks)
+            if len(result.hand_landmarks) > 0 and n_img == 0:
+                self._stale_strikes += 1
+            else:
+                self._stale_strikes = 0
+            if self._stale_strikes >= 2:
+                logger.warning("tracker latched on texture: rebuilding")
+                try:
+                    self._landmarker.close()
+                except Exception as exc:  # noqa: BLE001 - watchdog survives
+                    logger.debug("landmarker close failed: %s", exc)
+                self._landmarker = vision.HandLandmarker.create_from_options(
+                    self._vopts
+                )
+                self._stale_strikes = 0
+                self._coast = None
+                self._shist.clear()
+                self._slock = None
+                self._shape = None
+                self._anchor_f = None
+                self._ang_vec = None
+                self._filters = None
+                return []
 
         faces = self._face_boxes(frame_bgr)
         diag_due = now_s - self._last_diag >= 5.0
