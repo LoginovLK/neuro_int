@@ -79,6 +79,9 @@ ONNX-декод с фиксами, One Euro) перенесены дословн
 | `yolox_l.onnx` / `dw-ll_ucoco_384.onnx` are optional research artifacts (DWPose experiment, unused at runtime) | | |
 | `palm_detection_full_inf_post_192x192.onnx`, `hand_landmark_sparse_Nx3x224x224.onnx` | [PINTO0309 hand-gesture-recognition](https://github.com/PINTO0309/hand-gesture-recognition-using-onnx) | fallback backend (no mediapipe package) |
 
-The DWPose backend activates automatically when `yolox_l.onnx` and
+The **primary backend is the official MediaPipe** hand landmarker.
+The ONNX palm+landmark pair is the fallback when the mediapipe package
+is missing. The DWPose experiment files are unused at runtime.
+Historically the DWPose backend activated automatically when `yolox_l.onnx` and
 `dw-ll_ucoco_384.onnx` are present; otherwise the legacy palm+landmark
 pipeline runs.
