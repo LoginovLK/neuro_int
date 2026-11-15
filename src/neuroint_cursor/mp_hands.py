@@ -38,6 +38,10 @@ SHAPE_REFIT = 0.55
 # frame (Lev's report)
 TIPS_REFIT = 0.40
 TIPS = (8, 12, 16, 20)
+# static texture-latch (hair/chair stick): the VIDEO tracker latches onto
+# textures and redraws a hand forever; IMAGE-mode on the same frame finds
+# nothing. A non-pinch hand frozen in place for this long is locked out.
+STATIC_LATCH_SECONDS = 2.5
 # coast: when tracking drops (fast swipe, blur) keep the last skeleton and
 # carry it along the last bundle velocity instead of blinking off and
 # re-drawing at the new spot
@@ -101,6 +105,13 @@ class MediaPipeHands:
         # timestamp of the last REAL detection (coast does not update it):
         # control logic treats results older than ~0.1s as "no hand"
         self._last_fresh = 0.0
+        # static hallucination lock (Lev's hair stick): MediaPipe's VIDEO
+        # tracker latches onto textures (hair, chair) and re-draws a hand
+        # forever; IMAGE-mode on the same frame finds nothing. A candidate
+        # that stays put (box IoU / center median) for 2.5s without ever
+        # pinching is locked out until a pinch lands on that spot.
+        self._shist: deque[tuple[float, float, float, float, float]] = deque()
+        self._slock: tuple[float, float, float, float] | None = None
 
     # ---------------- helpers (carried over) ----------------
 
@@ -259,6 +270,7 @@ class MediaPipeHands:
 
         candidates: list[tuple[float, str, list[tuple[float, float]]]] = []
         n_raw = len(result.hand_landmarks)
+        min_dim = min(image_w, image_h)
         for lm_list, handedness in zip(
             result.hand_landmarks, result.handedness, strict=True
         ):
@@ -266,16 +278,32 @@ class MediaPipeHands:
             xs = [p[0] * image_w for p in pts]
             ys = [p[1] * image_h for p in pts]
             bcx, bcy = (max(xs) + min(xs)) / 2, (max(ys) + min(ys)) / 2
-            # face gate: a hand candidate sitting inside a detected face is
-            # the classic MediaPipe face false positive
+            # face gate: a hand candidate sitting inside a detected face (or in
+            # the hair cap above it) is the classic MediaPipe false positive
             on_face = any(
                 fx - 0.1 * fw <= bcx <= fx + 1.1 * fw
-                and fy - 0.1 * fh <= bcy <= fy + 1.1 * fh
+                and fy - 0.6 * fh <= bcy <= fy + 1.1 * fh
                 and (max(xs) - min(xs)) <= 1.3 * fw
                 for fx, fy, fw, fh in faces
             )
             if on_face:
                 continue
+            # static latch: the frozen hand occupying the locked spot is
+            # invisible; a pinch at that spot re-opens the lock (a real
+            # hand came back)
+            if self._slock is not None:
+                lx0, ly0, lx1, ly1 = self._slock
+                ioux = min(max(xs), lx1) - max(min(xs), lx0)
+                iouy = min(max(ys), ly1) - max(min(ys), ly0)
+                inter = ioux * iouy if ioux > 0 and iouy > 0 else 0.0
+                a1 = (max(xs) - min(xs)) * (max(ys) - min(ys))
+                a2 = (lx1 - lx0) * (ly1 - ly0)
+                iou = inter / max(a1 + a2 - inter, 1e-6)
+                if iou >= 0.25:
+                    if is_pinch(pts):
+                        self._slock = None  # a real hand retook the spot
+                    else:
+                        continue  # the latch itself: invisible
             cat = handedness[0]
             candidates.append((float(cat.score), cat.category_name, pts))
         if diag_due:
@@ -320,6 +348,35 @@ class MediaPipeHands:
             if pinched:
                 candidates = pinched
         score, handed, pts21 = max(candidates, key=lambda c: c[0])
+
+        # static latch accumulator: a hand frozen in place (center hovers
+        # near the window median) without ever pinching is a texture latch
+        pts_px = [(p[0] * image_w, p[1] * image_h) for p in pts21]
+        bb = (
+            min(p[0] for p in pts_px),
+            min(p[1] for p in pts_px),
+            max(p[0] for p in pts_px),
+            max(p[1] for p in pts_px),
+        )
+        if is_pinch(pts21):
+            self._shist.clear()
+        else:
+            self._shist.append((now_s, *bb))
+            horizon = now_s - STATIC_LATCH_SECONDS
+            while self._shist and self._shist[0][0] < horizon:
+                self._shist.popleft()
+            if len(self._shist) >= 25:
+                cxs = [(c[1] + c[3]) / 2 for c in self._shist]
+                cys = [(c[2] + c[4]) / 2 for c in self._shist]
+                mcx, mcy = median(cxs), median(cys)
+                if hypot(cxs[-1] - mcx, cys[-1] - mcy) <= 0.10 * min_dim:
+                    lx0, ly0, lx1, ly1 = self._shist[-1][1:]
+                    pad = 0.25 * max(lx1 - lx0, ly1 - ly0)
+                    self._slock = (lx0 - pad, ly0 - pad, lx1 + pad, ly1 + pad)
+                    self._shist.clear()
+                    self._coast = None
+                    logger.warning("static texture latch locked out")
+                    return []
 
         shaped = self._shape_apply(pts21, now_s, image_w, image_h)
         # gesture-change fix (Lev): if the RECOGNIZED gesture differs
