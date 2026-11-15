@@ -14,6 +14,7 @@ transform), still-pinch sticker lockout, YuNet face gate.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from collections import deque
 from math import atan2, cos, hypot, sin
@@ -126,8 +127,50 @@ class MediaPipeHands:
             min_hand_detection_confidence=0.5,
         )
         self._img_lm = vision.HandLandmarker.create_from_options(self._iopts)
-        self._last_validate = 0.0
+        # The watchdog lives on its OWN daemon thread: a full IMAGE-mode
+        # inference inside the 30fps loop stalled one frame every second
+        # (Lev: "детекция каждую секунду подтормаживает"). This thread
+        # only ever touches _img_lm; the main loop only touches
+        # _landmarker — no shared landmarker, no locks needed.
+        self._watch_frame: np.ndarray | None = None
+        self._watch_has_hand = False
         self._stale_strikes = 0
+        self._stale_trigger = False
+        threading.Thread(
+            target=self._watchdog_loop, name="mp-watchdog", daemon=True
+        ).start()
+
+    # ---------------- tracker-latch watchdog (own thread) ----------------
+
+    def _watchdog_loop(self) -> None:
+        """1 Hz, off the hot loop: re-check the latest frame with an
+        independent IMAGE-mode landmarker. The VIDEO tracker latches
+        onto textures and redraws a hand forever; two consecutive
+        "video sees a hand / image sees none" verdicts queue a rebuild,
+        which the main loop performs (it owns _landmarker). When the
+        VIDEO result has no hand there is nothing to latch — the
+        expensive re-check is skipped entirely."""
+        while True:
+            time.sleep(1.0)
+            if self._stale_trigger:
+                continue  # a rebuild is already queued, wait for it
+            frame = self._watch_frame
+            if frame is None or not self._watch_has_hand:
+                self._stale_strikes = 0
+                continue
+            try:
+                mp_image = self._mp_image_cls(image_format=self._srgb, data=frame)
+                img_res = self._img_lm.detect(mp_image)
+            except Exception as exc:  # noqa: BLE001 - watchdog must survive
+                logger.debug("watchdog detect failed: %s", exc)
+                continue
+            if img_res.hand_landmarks:
+                self._stale_strikes = 0
+            else:
+                self._stale_strikes += 1
+                if self._stale_strikes >= 2:
+                    self._stale_trigger = True
+                    logger.warning("tracker latched on texture: rebuild queued")
 
     # ---------------- helpers (carried over) ----------------
 
@@ -281,35 +324,35 @@ class MediaPipeHands:
         mp_image = self._mp_image_cls(image_format=self._srgb, data=rgb)
         result = self._landmarker.detect_for_video(mp_image, ts_ms)
 
-        # tracker-latch watchdog (1 Hz): the independent IMAGE detector
-        # re-checks the same frame; after two consecutive "video sees a
-        # hand / image sees none" the VIDEO tracker has latched onto a
-        # texture - rebuild it (the only track reset it cannot do itself)
-        if now_s - self._last_validate >= 1.0:
-            self._last_validate = now_s
-            n_img = len(self._img_lm.detect(mp_image).hand_landmarks)
-            if len(result.hand_landmarks) > 0 and n_img == 0:
-                self._stale_strikes += 1
-            else:
-                self._stale_strikes = 0
-            if self._stale_strikes >= 2:
-                logger.warning("tracker latched on texture: rebuilding")
-                try:
-                    self._landmarker.close()
-                except Exception as exc:  # noqa: BLE001 - watchdog survives
-                    logger.debug("landmarker close failed: %s", exc)
-                self._landmarker = vision.HandLandmarker.create_from_options(
-                    self._vopts
-                )
-                self._stale_strikes = 0
-                self._coast = None
-                self._shist.clear()
-                self._slock = None
-                self._shape = None
-                self._anchor_f = None
-                self._ang_vec = None
-                self._filters = None
-                return []
+        # watchdog bookkeeping (both O(1)): hand the fresh frame copy and
+        # the "video saw a hand" verdict to the background watchdog thread.
+        # `rgb` is a unique array per frame and never mutated afterwards,
+        # so the watchdog can safely read it a second later.
+        self._watch_frame = rgb
+        self._watch_has_hand = bool(result.hand_landmarks)
+
+        # the watchdog thread flagged a texture latch (2 strikes): rebuild
+        # the VIDEO tracker here on the main thread — it owns _landmarker.
+        # Rare (latch events only), the per-second re-check is NOT here.
+        if self._stale_trigger:
+            self._stale_trigger = False
+            self._stale_strikes = 0
+            logger.warning("tracker latch confirmed: rebuilding VIDEO tracker")
+            try:
+                self._landmarker.close()
+            except Exception as exc:  # noqa: BLE001 - rebuild must survive
+                logger.debug("landmarker close failed: %s", exc)
+            self._landmarker = vision.HandLandmarker.create_from_options(
+                self._vopts
+            )
+            self._coast = None
+            self._shist.clear()
+            self._slock = None
+            self._shape = None
+            self._anchor_f = None
+            self._ang_vec = None
+            self._filters = None
+            return []
 
         faces = self._face_boxes(frame_bgr)
         diag_due = now_s - self._last_diag >= 5.0
