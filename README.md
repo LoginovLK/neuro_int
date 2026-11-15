@@ -67,3 +67,16 @@ Venv `.venv-edge` уже на месте (onnxruntime-directml, opencv, pynput, 
 локальный процесс без сети, без контейнеров, без промежуточных слоёв: меньше
 поверхностей — меньше мест, где сломаться. Proven-куски (drain-reader,
 ONNX-декод с фиксами, One Euro) перенесены дословно.
+
+## Models (downloaded into `models/`, gitignored)
+
+| file | source | used by |
+|---|---|---|
+| `yolox_l.onnx` (216MB) | [yzd-v/DWPose](https://huggingface.co/yzd-v/DWPose) | person detector (DWPose backend) |
+| `dw-ll_ucoco_384.onnx` (134MB) | [yzd-v/DWPose](https://huggingface.co/yzd-v/DWPose) | RTMPose wholebody, 133 keypoints (DWPose backend) |
+| `face_detection_yunet_2023mar.onnx` (232KB) | [opencv_zoo](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet) | face gate (legacy backend) |
+| `palm_detection_full_inf_post_192x192.onnx`, `hand_landmark_sparse_Nx3x224x224.onnx` | [PINTO0309 hand-gesture-recognition](https://github.com/PINTO0309/hand-gesture-recognition-using-onnx) | legacy palm+landmark backend |
+
+The DWPose backend activates automatically when `yolox_l.onnx` and
+`dw-ll_ucoco_384.onnx` are present; otherwise the legacy palm+landmark
+pipeline runs.
