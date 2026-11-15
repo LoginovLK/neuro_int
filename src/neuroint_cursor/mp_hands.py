@@ -23,7 +23,7 @@ from statistics import median
 import cv2
 import numpy as np
 
-from neuroint_cursor.pose import is_pinch
+from neuroint_cursor.pose import is_pinch, pinch_center
 from neuroint_cursor.smoothing import PointFilter2D
 
 logger = logging.getLogger(__name__)
@@ -32,6 +32,17 @@ STILL_PINCH_SECONDS = 5.0
 STILL_TIP_SPREAD = 0.02
 LOCK_UNLOCK_PX = 0.06
 SHAPE_REFIT = 0.55
+# fingertip divergence alone forces an instant re-freeze: when the gesture
+# changes, only the tips move (the palm stays), the all-point median never
+# reached the threshold and the old pose stuck until the hand left the
+# frame (Lev's report)
+TIPS_REFIT = 0.55
+TIPS = (8, 12, 16, 20)
+# coast: when tracking drops (fast swipe, blur) keep the last skeleton and
+# carry it along the last bundle velocity instead of blinking off and
+# re-drawing at the new spot
+COAST_SECONDS = 0.35
+COAST_VEL_CAP = 1500.0  # px/s
 
 
 class MediaPipeHands:
@@ -79,6 +90,10 @@ class MediaPipeHands:
         self._lock: tuple[float, float, float, float] | None = None
         self._lock_seen = 0.0
         self._last_diag = 0.0
+        self._coast: tuple[list[tuple[float, float]], str, float] | None = None
+        self._coast_t = 0.0
+        self._bundle_prev: tuple[float, float] | None = None
+        self._bundle_vel: tuple[float, float] = (0.0, 0.0)
 
     # ---------------- helpers (carried over) ----------------
 
@@ -136,6 +151,17 @@ class MediaPipeHands:
             hypot(emitted[i][0] - px[i][0], emitted[i][1] - px[i][1])
             for i in range(21)
         ) / hand
+        tips_div = median(
+            hypot(emitted[i][0] - px[i][0], emitted[i][1] - px[i][1]) for i in TIPS
+        ) / hand
+        if tips_div > TIPS_REFIT:
+            # gesture change: the tips moved while the palm stayed —
+            # re-freeze hard from the live cloud
+            self._shape = (
+                [((p[0] - px[0][0]) / hand, (p[1] - px[0][1]) / hand) for p in px],
+                ang_f,
+            )
+            return [(x / image_w, y / image_h) for x, y in px]
         if div > SHAPE_REFIT:
             self._shape = (
                 [((p[0] - px[0][0]) / hand, (p[1] - px[0][1]) / hand) for p in px],
@@ -165,8 +191,6 @@ class MediaPipeHands:
         image_h: int,
     ) -> bool:
         min_dim = min(image_w, image_h)
-        from neuroint_cursor.pose import pinch_center
-
         bfx, bfy = pinch_center(points)
         cx, cy = bfx * image_w, bfy * image_h
         if self._lock is not None:
@@ -193,6 +217,7 @@ class MediaPipeHands:
                     self._lock = (cx, cy, 0.0, 0.0)
                     self._lock_seen = now_s
                     self._tip_hist.clear()
+                    self._coast = None  # a locked sticker must not coast
                     logger.warning("still-pinch sticker locked out")
                     return True
         else:
@@ -247,10 +272,33 @@ class MediaPipeHands:
                 len(faces),
             )
         if not candidates:
+            # coast: no blink-off — carry the last skeleton along the last
+            # bundle velocity for a short grace period
+            if (
+                self._coast is not None
+                and self._lock is None
+                and now_s - self._coast_t <= COAST_SECONDS
+            ):
+                dt = max(now_s - self._coast_t, 1 / 120)
+                dx = max(
+                    min(self._bundle_vel[0] * dt, COAST_VEL_CAP * dt),
+                    -COAST_VEL_CAP * dt,
+                )
+                dy = max(
+                    min(self._bundle_vel[1] * dt, COAST_VEL_CAP * dt),
+                    -COAST_VEL_CAP * dt,
+                )
+                pts, handed, score = self._coast
+                pts = [(p[0] + dx / image_w, p[1] + dy / image_h) for p in pts]
+                self._coast = (pts, handed, score)
+                self._coast_t = now_s
+                return [(pts, handed, score)]
             self._shape = None
             self._anchor_f = None
             self._ang_vec = None
             self._filters = None
+            self._bundle_prev = None
+            self._bundle_vel = (0.0, 0.0)
             return []
         if prefer_pinch:
             pinched = [c for c in candidates if is_pinch(c[2])]
@@ -260,7 +308,25 @@ class MediaPipeHands:
 
         shaped = self._shape_apply(pts21, now_s, image_w, image_h)
         points = self._smooth(shaped, now_s)
+
+        # bundle velocity for coasting
+        bfx, bfy = pinch_center(points)
+        bx, by = bfx * image_w, bfy * image_h
+        if self._bundle_prev is not None:
+            dt = max(now_s - self._coast_t, 1 / 120)
+            nvx = (bx - self._bundle_prev[0]) / dt
+            nvy = (by - self._bundle_prev[1]) / dt
+            nvx = max(min(nvx, COAST_VEL_CAP), -COAST_VEL_CAP)
+            nvy = max(min(nvy, COAST_VEL_CAP), -COAST_VEL_CAP)
+            self._bundle_vel = (
+                0.6 * self._bundle_vel[0] + 0.4 * nvx,
+                0.6 * self._bundle_vel[1] + 0.4 * nvy,
+            )
+        self._bundle_prev = (bx, by)
+
         pinch_now = is_pinch(points)
         if self._sticker_check(points, pinch_now, now_s, image_w, image_h):
             return []
+        self._coast = (points, handed, score)
+        self._coast_t = now_s
         return [(points, handed, score)]
