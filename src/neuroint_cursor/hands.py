@@ -125,32 +125,38 @@ def _keep_aspect_resize_and_pad(
 
 
 def _rotate_and_crop(image: np.ndarray, rect: np.ndarray) -> np.ndarray:
-    """Crop a rotated rectangle (mirror padding when it leaves the frame)."""
+    """Crop a rotated rectangle (mirror padding only where it leaves the frame).
+
+    Pads a LOCAL window around the box instead of the whole frame: the old
+    full-frame copyMakeBorder cost ~10ms per landmark call, and the retry
+    sweep runs it up to 5 times per frame (the live 14.5fps bug). Same
+    geometry: the local window IS the axis-aligned bbox region the old
+    code cropped out of the padded frame.
+    """
     # rect comes in as float32: everything used for slicing must be int.
     cx, cy, rect_w, rect_h = int(rect[0]), int(rect[1]), int(rect[2]), int(rect[3])
     angle = float(rect[4])
-    # Mirror-reflection padding instead of black: a hand at the frame edge
-    # gets a seamless continuation, so the landmark model keeps its score.
-    pad_x = (image.shape[1] // 2) + rect_w
-    pad_y = (image.shape[0] // 2) + rect_h
-    padded = cv2.copyMakeBorder(
-        image, pad_y, pad_y, pad_x, pad_x, cv2.BORDER_REFLECT_101
-    )
-    cx += pad_x
-    cy += pad_y
-
     rect_tuple = ((cx, cy), (rect_w, rect_h), angle)
     box = cv2.boxPoints(rect_tuple)
     x_min, y_min = int(np.min(box[:, 0])), int(np.min(box[:, 1]))
     x_max, y_max = int(np.max(box[:, 0])), int(np.max(box[:, 1]))
-    bx_cx, bx_cy = int((x_min + x_max) // 2), int((y_min + y_max) // 2)
-    bx_w, bx_h = x_max - x_min, y_max - y_min
+    img_h, img_w = image.shape[:2]
+    ix0, iy0 = max(x_min, 0), max(y_min, 0)
+    ix1, iy1 = min(x_max, img_w), min(y_max, img_h)
+    if ix1 - ix0 < 2 or iy1 - iy0 < 2:
+        return np.zeros((0, 0, 3), np.uint8)
+    local = image[iy0:iy1, ix0:ix1]
+    pad_top, pad_left = iy0 - y_min, ix0 - x_min
+    pad_bottom, pad_right = y_max - iy1, x_max - ix1
+    if pad_top or pad_bottom or pad_left or pad_right:
+        # Mirror-reflection padding instead of black: a hand at the frame
+        # edge gets a seamless continuation, so the landmark model keeps
+        # its score (same BORDER_REFLECT_101 as before, just local).
+        local = cv2.copyMakeBorder(
+            local, pad_top, pad_bottom, pad_left, pad_right, cv2.BORDER_REFLECT_101
+        )
 
-    upright = padded[
-        bx_cy - bx_h // 2 : bx_cy + (bx_h - bx_h // 2),
-        bx_cx - bx_w // 2 : bx_cx + (bx_w - bx_w // 2),
-    ]
-    height, width = upright.shape[:2]
+    height, width = local.shape[:2]
     center = (width // 2, height // 2)
     matrix = cv2.getRotationMatrix2D(center, int(angle), 1)
     abs_cos, abs_sin = abs(matrix[0, 0]), abs(matrix[0, 1])
@@ -158,7 +164,7 @@ def _rotate_and_crop(image: np.ndarray, rect: np.ndarray) -> np.ndarray:
     bound_h = int(height * abs_cos + width * abs_sin)
     matrix[0, 2] += bound_w / 2 - center[0]
     matrix[1, 2] += bound_h / 2 - center[1]
-    rotated = cv2.warpAffine(upright, matrix, (bound_w, bound_h))
+    rotated = cv2.warpAffine(local, matrix, (bound_w, bound_h))
 
     crop_cx, crop_cy = bound_w // 2, bound_h // 2
     return rotated[
@@ -175,7 +181,6 @@ class OnnxHands:
         palm_model: str | Path,
         landmark_model: str | Path,
         score_threshold: float = 0.4,
-        far_palm_threshold: float = 0.3,
         class_score_threshold: float = 0.25,
         tracking: bool = True,
         clahe: bool = True,
@@ -197,7 +202,6 @@ class OnnxHands:
         self._lm_hw = (int(lm_shape[2]), int(lm_shape[3]))
 
         self._score_threshold = score_threshold
-        self._far_palm_threshold = far_palm_threshold
         self._class_score_threshold = class_score_threshold
         self._tracking = tracking
         self._clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) if clahe else None
@@ -236,9 +240,12 @@ class OnnxHands:
         """Stage 1: palm boxes -> landmark-crop rects (frame pixels)."""
         image_h, image_w = frame_bgr.shape[:2]
         palm_hw_w, palm_hw_h = self._palm_hw[1], self._palm_hw[0]
-        enhanced = self._enhance(frame_bgr) if self._clahe is not None else frame_bgr
-        padded, _ = _keep_aspect_resize_and_pad(enhanced, palm_hw_w, palm_hw_h)
-        blob = padded / 255.0
+        padded, _ = _keep_aspect_resize_and_pad(frame_bgr, palm_hw_w, palm_hw_h)
+        # CLAHE AFTER the 192x192 resize: same contrast lift, ~0.2ms
+        # instead of ~10ms on the full 1280x720 frame (the old order
+        # enhanced every pixel of the frame only to shrink it 7x).
+        enhanced = self._enhance(padded) if self._clahe is not None else padded
+        blob = enhanced / 255.0
         blob = blob[..., ::-1].transpose(2, 0, 1)[None].astype(np.float32)
         boxes = self._palm.run(self._palm_out, {self._palm_input: blob})[0]
 
@@ -526,8 +533,12 @@ class OnnxHands:
         now_s = time.monotonic()
 
         # --- primary: palm detector every frame ---
-        track_alive = self._prev_points_norm is not None
-        palm_thr = self._score_threshold if track_alive else self._far_palm_threshold
+        # ONE threshold (0.4) for both states. The old 0.3 "far hand"
+        # threshold is dead: on Lev's face frame the palm model fires two
+        # boxes that live ONLY at 0.3 (zero at 0.4), while the real hand
+        # at working distance scores >=0.5 — the 0.3 knob was anchoring
+        # the face, not finding far hands.
+        palm_thr = self._score_threshold
         best = self._best_palm_candidate(
             frame_bgr, image_w, image_h, palm_thr, prefer_pointing
         )
