@@ -40,7 +40,9 @@ logger = logging.getLogger(__name__)
 # SimCC decode: heatmaps are split at 2x the input resolution.
 SIMCC_SPLIT = 2.0
 PERSON_THR = 0.35
-KPT_THR = 0.50   # SimCC logits (RAW-input models): visible parts score 1..8
+# body wrist (COCO 9/10) SimCC logits: visible raised wrist scores well
+# above this, hallucinated/hidden ones below (measured on Lev's frames)
+WRIST_THR = 4.0
 # COCO-WholeBody: left hand keypoints 91..111, right hand 112..132.
 LEFT_HAND = slice(91, 112)
 RIGHT_HAND = slice(112, 133)
@@ -77,6 +79,8 @@ class DWPoseHands:
         self,
         det_model: str | Path,
         pose_model: str | Path,
+        palm_model: str | Path,
+        landmark_model: str | Path,
         clahe: bool = False,
     ) -> None:
         options = ort.SessionOptions()
@@ -84,6 +88,12 @@ class DWPoseHands:
         providers = ["DmlExecutionProvider", "CPUExecutionProvider"]
         self._det = ort.InferenceSession(str(det_model), options, providers=providers)
         self._pose = ort.InferenceSession(str(pose_model), options, providers=providers)
+        # dedicated hand landmark model (locates 21 points on a wrist crop)
+        from neuroint_cursor.hands import OnnxHands
+
+        self._lm = OnnxHands(
+            palm_model, landmark_model, tracking=False, clahe=clahe
+        )
         logger.info("dwpose providers: %s", self._pose.get_providers())
 
         self._det_in = self._det.get_inputs()[0].name
@@ -314,29 +324,33 @@ class DWPoseHands:
         )
         keypoints, scores = self._run_pose(frame_bgr, (x1, y1, x2, y2))
 
+        # Hands are NOT taken from the wholebody model: on invisible hands
+        # it hallucinates confident keypoints on textures (measured: a
+        # chair scored 22 while the REAL raised hand scored 0.6). The
+        # wholebody model only LOCATES wrists (body keypoints are solid);
+        # the dedicated PINTO 224 landmark model then draws the actual
+        # 21-point hand on a crop around the wrist — the MediaPipe
+        # architecture (locate -> crop -> landmark), best of both models.
+        hand_size = float(min(max(0.25 * (y2 - y1), 90.0), 360.0))
         candidates = []
-        for sl, handed in ((LEFT_HAND, "Left"), (RIGHT_HAND, "Right")):
-            kp = keypoints[sl]
-            sc = scores[sl]
-            visible = sc > KPT_THR
-            if int(visible.sum()) < 12:
+        wr = []
+        for idx, handed in ((10, "Left"), (9, "Right")):
+            if scores[idx] < WRIST_THR:
                 continue
-            pts21 = [
-                (float(kp[i][0]) / image_w, float(kp[i][1]) / image_h)
-                for i in range(21)
-            ]
-            candidates.append(
-                (float(visible.mean()), handed, pts21, float(visible.mean()))
-            )
+            wr.append((idx, handed))
+            cx, cy = float(keypoints[idx][0]), float(keypoints[idx][1])
+            rect = [cx, cy, hand_size, hand_size, 0.0]
+            out = self._lm._landmark_smart(frame_bgr, rect)  # noqa: SLF001
+            if out is None:
+                continue
+            candidates.append((out, handed))
         if diag_due:
             self._last_diag = now_s
             logger.info(
-                "diag: persons %d  handL vis %d (mean %.2f)  handR vis %d (mean %.2f)",
+                "diag: persons %d  wrist scores %s  hand cands %s",
                 len(persons),
-                int((scores[LEFT_HAND] > KPT_THR).sum()),
-                float(scores[LEFT_HAND].mean()),
-                int((scores[RIGHT_HAND] > KPT_THR).sum()),
-                float(scores[RIGHT_HAND].mean()),
+                {i: round(float(scores[i]), 1) for i, _ in wr},
+                [(hd, round(o[2], 2)) for o, hd in candidates],
             )
         if not candidates:
             if diag_due:
@@ -345,10 +359,11 @@ class DWPoseHands:
             self.reset_filters()
             return []
         if prefer_pinch:
-            pinched = [c for c in candidates if is_pinch(c[2])]
+            pinched = [c for c in candidates if is_pinch(c[0][0])]
             if pinched:
                 candidates = pinched
-        _, handed, pts21, score = max(candidates, key=lambda c: c[0])
+        out, handed = max(candidates, key=lambda c: c[0][2])
+        pts21, _h, score = out
 
         shaped = self._shape_apply(pts21, image_w, image_h)
         points = self._smooth(shaped, now_s)

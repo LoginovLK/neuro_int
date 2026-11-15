@@ -58,25 +58,21 @@ def main() -> int:
         cfg.debug_window = False
 
     cam = Camera(cfg.camera_index, cfg.width, cfg.height, cfg.fps, cfg.mirror)
-    if DWPOSE_DET.exists() and DWPOSE_POSE.exists():
-        # researched replacement (Lev): DWPose RTMPose wholebody — hands
-        # an order better than the MediaPipe-class sparse models, real-
-        # time on the 3090.
-        from neuroint_cursor.dwpose_hands import DWPoseHands
-
-        hands = DWPoseHands(DWPOSE_DET, DWPOSE_POSE)  # type: ignore[assignment]
-        logger.info("backend: DWPose wholebody (yolox + rtmpose-133)")
-    else:
-        hands = OnnxHands(
-            PALM_MODEL,
-            LANDMARK_MODEL,
-            score_threshold=cfg.palm_score_threshold,
-            class_score_threshold=cfg.landmark_score_threshold,
-            tracking=cfg.tracking,
-            clahe=cfg.clahe,
-            face_model=FACE_MODEL,
-        )
-        logger.info("backend: palm+landmark (dwpose models not found)")
+    # palm-first pipeline (PINTO palm every frame + dedicated 224 hand
+    # landmark): measured better than the DWPose wholebody experiment -
+    # wholebody models hallucinate confident hands on textures where no
+    # hand exists (chair 22-38 logits vs real raised hand 0.6-1.1).
+    # dwpose_hands.py stays in the repo as a research artifact.
+    hands = OnnxHands(
+        PALM_MODEL,
+        LANDMARK_MODEL,
+        score_threshold=cfg.palm_score_threshold,
+        class_score_threshold=cfg.landmark_score_threshold,
+        tracking=cfg.tracking,
+        clahe=cfg.clahe,
+        face_model=FACE_MODEL,
+    )
+    logger.info("backend: palm-first (pinto palm + 224 landmark, yunet gate)")
     act = CursorActuator(cfg.sensitivity, cfg.min_cutoff, cfg.beta)
     logger.info(
         "screen %dx%d  full-frame mapping",
