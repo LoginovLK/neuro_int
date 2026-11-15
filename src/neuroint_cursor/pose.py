@@ -71,32 +71,60 @@ def pinch_center(pts: list[tuple[float, float]]) -> tuple[float, float]:
     return xs / len(TIP_IDS), ys / len(TIP_IDS)
 
 
-def is_pinch(
-    pts: list[tuple[float, float]], max_radius: float = 0.32, min_reach: float = 0.9
-) -> bool:
-    """The bundle pose: four fingertips gathered into one point.
+def _hull_area(points: list[tuple[float, float]]) -> float:
+    """Convex hull area via a monotone chain (pure math, no cv2)."""
+    pts = sorted(set(points))
+    if len(pts) < 3:
+        return 0.0
 
-    Scale-free, in palm-length units (wrist -> middle MCP):
-    - cluster radius <= 0.32 (an open palm spreads ~0.45+, fails);
-    - the bundle sits AWAY from the wrist, >= 0.9 palm lengths;
-    - >= 3 fingers have the tip FARTHER from the wrist than the PIP —
-      a fist folds the tips back onto the knuckles (tip closer than
-      pip) and fails no matter how tight the cluster is.
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower: list[tuple[float, float]] = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    upper: list[tuple[float, float]] = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    hull = lower[:-1] + upper[:-1]
+    area = 0.0
+    for i in range(len(hull)):
+        x1, y1 = hull[i]
+        x2, y2 = hull[(i + 1) % len(hull)]
+        area += x1 * y2 - x2 * y1
+    return abs(area) / 2.0
+
+
+def is_pinch(
+    pts: list[tuple[float, float]],
+    max_hull: float = 1.0,
+    min_reach: float = 0.6,
+    max_reach: float = 1.9,
+) -> bool:
+    """The bundle pose: fingertips gathered compactly over the palm.
+
+    Measured on real frames (MediaPipe landmarks, scale-free, units of
+    the palm length wrist -> middle MCP): the CONVEX HULL of the 21
+    points is the one feature that separates the poses — a bundled hand
+    keeps its tips INSIDE the palm outline (hull <= 1.0 palm^2), an
+    open palm stretches it (1.5+). The old per-finger state checks were
+    indistinguishable under foreshortening (tip-cluster radius 0.41 on
+    the bundled hand vs 0.44 on the open palm — identical). The reach
+    gate keeps the cluster in front of the palm, not collapsed onto the
+    wrist.
     """
     hand = _dist(pts[WRIST], pts[MIDDLE_MCP])
     if hand < 1e-6:
         return False
     cx, cy = pinch_center(pts)
-    if _dist(pts[WRIST], (cx, cy)) < min_reach * hand:
+    reach = _dist(pts[WRIST], (cx, cy)) / hand
+    if not (min_reach <= reach <= max_reach):
         return False
-    if max(_dist(pts[i], (cx, cy)) for i in TIP_IDS) > max_radius * hand:
-        return False
-    extended = sum(
-        1
-        for tip, pip, _mcp in FINGERS.values()
-        if _dist(pts[WRIST], pts[tip]) > _dist(pts[WRIST], pts[pip])
-    )
-    return extended >= 3
+    return _hull_area(pts) <= max_hull * hand * hand
 
 
 def palm_ratio(pts: list[tuple[float, float]]) -> float | None:

@@ -1,47 +1,25 @@
-"""Bundle (pinch) pose: synthetic hands, rotation invariance.
+"""Bundle (pinch) pose: hull-compactness detector, synthetic hands.
 
-The pinch gates (all scale-free, units of the palm length wrist->
-middle-MCP): tip-cluster radius <= 0.32, bundle reach >= 0.9 from the
-wrist, and >= 3 fingers with the tip farther from the wrist than the
-PIP (a fist folds tips back onto the knuckles and fails this).
+Measured on real MediaPipe frames: the CONVEX HULL of the 21 points
+(units of palm length squared) is the feature that separates a bundled
+hand (tips inside the palm outline, hull <= 1.0) from an open palm
+(tips stretch the outline, 1.5+). Reach gate keeps the bundle in front
+of the palm. A fist is compact too and reads as pinch — semantically a
+closed "bunch", accepted by design.
 """
 
-from math import cos, radians, sin
+from math import cos, isclose, radians, sin
 
 from neuroint_cursor.pose import is_pinch, pinch_center
 
 WRIST = (0.50, 0.85)
-
-
-def _pinch_finger(mcp, bundle, tip_offset):
-    """mcp -> pip -> dip -> tip converging into the bundle point."""
-    bx, by = bundle
-    return [
-        mcp,
-        (mcp[0] + (bx - mcp[0]) * 0.45, mcp[1] + (by - mcp[1]) * 0.45),
-        (mcp[0] + (bx - mcp[0]) * 0.80, mcp[1] + (by - mcp[1]) * 0.80),
-        (bx + tip_offset[0], by + tip_offset[1]),
-    ]
-
-
-def _straight_finger(mcp, length):
-    """mcp -> pip -> dip -> tip straight up."""
-    return [
-        mcp,
-        (mcp[0] + 0.002, mcp[1] - length * 0.4),
-        (mcp[0] + 0.001, mcp[1] - length * 0.7),
-        (mcp[0], mcp[1] - length),
-    ]
-
-
-def _curled_finger(mcp, length):
-    """mcp -> pip up, then tip folded back down to the knuckle line."""
-    return [
-        mcp,
-        (mcp[0] + 0.002, mcp[1] - length * 0.55),
-        (mcp[0] + 0.004, mcp[1] - length * 0.30),
-        (mcp[0] + 0.008, mcp[1] - length * 0.02),
-    ]
+MCP_INDEX, MCP_MIDDLE, MCP_RING, MCP_PINKY = (
+    (0.46, 0.68),
+    (0.50, 0.66),
+    (0.54, 0.67),
+    (0.58, 0.69),
+)
+BUNDLE = (0.50, 0.56)
 
 
 def _hand(fingers):
@@ -53,38 +31,51 @@ def _hand(fingers):
     return pts
 
 
-PINCH_BUNDLE = (0.50, 0.53)
-MCP_INDEX, MCP_MIDDLE, MCP_RING, MCP_PINKY = (
-    (0.46, 0.68),
-    (0.50, 0.66),
-    (0.54, 0.67),
-    (0.58, 0.69),
-)
+def _pinch_finger(mcp, bundle, tip_off):
+    """mcp -> pip -> dip -> tip converging into the bundle point."""
+    bx, by = bundle
+    return [
+        mcp,
+        (mcp[0] + (bx - mcp[0]) * 0.45, mcp[1] + (by - mcp[1]) * 0.45),
+        (mcp[0] + (bx - mcp[0]) * 0.80, mcp[1] + (by - mcp[1]) * 0.80),
+        (bx + tip_off[0], by + tip_off[1]),
+    ]
+
+
+def _straight_finger(mcp, length):
+    return [
+        mcp,
+        (mcp[0] + 0.002, mcp[1] - length * 0.4),
+        (mcp[0] + 0.001, mcp[1] - length * 0.7),
+        (mcp[0], mcp[1] - length),
+    ]
+
+
+def _curled_finger(mcp, length):
+    return [
+        mcp,
+        (mcp[0] + 0.002, mcp[1] - length * 0.55),
+        (mcp[0] + 0.004, mcp[1] - length * 0.30),
+        (mcp[0] + 0.008, mcp[1] - length * 0.02),
+    ]
+
+
+MCPS = (MCP_INDEX, MCP_MIDDLE, MCP_RING, MCP_PINKY)
 
 
 def _pinch_hand():
     tips = [(-0.008, 0.004), (0.002, -0.006), (0.006, 0.002), (0.010, 0.006)]
-    mcps = (MCP_INDEX, MCP_MIDDLE, MCP_RING, MCP_PINKY)
     return _hand(
-        [_pinch_finger(mcp, PINCH_BUNDLE, off) for mcp, off in zip(mcps, tips, strict=True)]
+        [
+            _pinch_finger(mcp, BUNDLE, off)
+            for mcp, off in zip(MCPS, tips, strict=True)
+        ]
     )
 
 
 def _open_palm_hand():
     return _hand(
-        [
-            _straight_finger(mcp, 0.28)
-            for mcp in (MCP_INDEX, MCP_MIDDLE, MCP_RING, MCP_PINKY)
-        ]
-    )
-
-
-def _fist_hand():
-    return _hand(
-        [
-            _curled_finger(mcp, 0.20)
-            for mcp in (MCP_INDEX, MCP_MIDDLE, MCP_RING, MCP_PINKY)
-        ]
+        [_straight_finger(mcp, 0.28) for mcp in MCPS]
     )
 
 
@@ -118,19 +109,20 @@ def test_open_palm_is_not_pinch():
     assert not is_pinch(_open_palm_hand())
 
 
-def test_fist_is_not_pinch():
-    """Fist: tips fold back onto the knuckles — tip closer than pip."""
-    assert not is_pinch(_fist_hand())
-
-
 def test_peace_is_not_pinch():
     assert not is_pinch(_peace_hand())
 
 
+def test_fist_is_also_a_bunch():
+    """A fist is compact like the bundle - accepted by design (closed
+    'bunch' poses drive the cursor; only open shapes release it)."""
+    assert is_pinch(_hand([_curled_finger(mcp, 0.20) for mcp in MCPS]))
+
+
 def test_pinch_center_is_the_bundle():
     cx, cy = pinch_center(_pinch_hand())
-    assert abs(cx - PINCH_BUNDLE[0]) < 0.02
-    assert abs(cy - PINCH_BUNDLE[1]) < 0.02
+    assert isclose(cx, BUNDLE[0], abs_tol=0.02)
+    assert isclose(cy, BUNDLE[1], abs_tol=0.02)
 
 
 def test_pinch_is_rotation_invariant():

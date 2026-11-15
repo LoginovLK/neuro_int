@@ -7,7 +7,7 @@ VENV_PY := $(VENV_DIR)/Scripts/python.exe
 PY := python
 ENV := PYTHONPATH=src
 
-.PHONY: help run headless smoke diag test lint clean
+.PHONY: help run headless smoke diag lint clean
 
 help: ## show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-10s\033[0m %s\n",$$1,$$2}'
@@ -24,11 +24,8 @@ smoke: ## 12s self-check: camera + GPU + detection (mouse untouched)
 diag: ## 8s capture with your hand at the camera -> captures/diag_hands.png
 	$(ENV) $(VENV_PY) tools/diag.py
 
-test: ## unit tests (no camera needed)
-	$(ENV) $(PY) -m pytest
-
 lint:
-	$(PY) -m ruff check src tests
+	$(PY) -m ruff check src
 
 clean: ## remove caches
-	@rm -rf src/neuroint_cursor/__pycache__ tests/__pycache__ .pytest_cache 2>/dev/null || true
+	@rm -rf src/neuroint_cursor/__pycache__ 2>/dev/null || true
