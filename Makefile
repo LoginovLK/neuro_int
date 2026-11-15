@@ -7,10 +7,13 @@ VENV_PY := $(VENV_DIR)/Scripts/python.exe
 PY := python
 ENV := PYTHONPATH=src
 
-.PHONY: help run headless smoke diag lint clean
+.PHONY: help run headless smoke diag models lint clean
 
 help: ## show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-10s\033[0m %s\n",$$1,$$2}'
+
+models: ## download model files into models/ (fresh clone)
+	$(VENV_PY) tools/fetch_models.py
 
 run: ## control the cursor with the index finger (debug window; q quits)
 	$(ENV) $(VENV_PY) -m neuroint_cursor
