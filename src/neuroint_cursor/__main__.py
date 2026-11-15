@@ -28,6 +28,8 @@ MODELS = Path(__file__).resolve().parents[2] / "models"
 PALM_MODEL = MODELS / "palm_detection_full_inf_post_192x192.onnx"
 LANDMARK_MODEL = MODELS / "hand_landmark_sparse_Nx3x224x224.onnx"
 FACE_MODEL = MODELS / "face_detection_yunet_2023mar.onnx"
+DWPOSE_DET = MODELS / "yolox_l.onnx"
+DWPOSE_POSE = MODELS / "dw-ll_ucoco_384.onnx"
 
 
 def parse_args() -> argparse.Namespace:
@@ -46,21 +48,30 @@ def main() -> int:
         cfg.debug_window = False
 
     cam = Camera(cfg.camera_index, cfg.width, cfg.height, cfg.fps, cfg.mirror)
-    hands = OnnxHands(
-        PALM_MODEL,
-        LANDMARK_MODEL,
-        score_threshold=cfg.palm_score_threshold,
-        class_score_threshold=cfg.landmark_score_threshold,
-        tracking=cfg.tracking,
-        clahe=cfg.clahe,
-        face_model=FACE_MODEL,
-    )
+    if DWPOSE_DET.exists() and DWPOSE_POSE.exists():
+        # researched replacement (Lev): DWPose RTMPose wholebody — hands
+        # an order better than the MediaPipe-class sparse models, real-
+        # time on the 3090.
+        from neuroint_cursor.dwpose_hands import DWPoseHands
+
+        hands = DWPoseHands(DWPOSE_DET, DWPOSE_POSE)  # type: ignore[assignment]
+        logger.info("backend: DWPose wholebody (yolox + rtmpose-133)")
+    else:
+        hands = OnnxHands(
+            PALM_MODEL,
+            LANDMARK_MODEL,
+            score_threshold=cfg.palm_score_threshold,
+            class_score_threshold=cfg.landmark_score_threshold,
+            tracking=cfg.tracking,
+            clahe=cfg.clahe,
+            face_model=FACE_MODEL,
+        )
+        logger.info("backend: palm+landmark (dwpose models not found)")
     act = CursorActuator(cfg.sensitivity, cfg.min_cutoff, cfg.beta)
     logger.info(
-        "screen %dx%d  full-frame mapping  provider %s",
+        "screen %dx%d  full-frame mapping",
         act.screen_w,
         act.screen_h,
-        "DML" if "DmlExecutionProvider" in hands._landmark.get_providers() else "CPU",  # noqa: SLF001
     )
 
     win = "neuroint cursor"
@@ -101,7 +112,7 @@ def main() -> int:
                 results = hands.detect(frame, prefer_pinch=active)
                 result = results[0] if results else None
                 if not results:
-                    hands.reset_smoothing()
+                    pass  # filters reset inside the backend on track loss
 
                 pointing = result is not None and is_pinch(result[0])
                 # Debounce both edges: ON after a few straight-pointing frames,

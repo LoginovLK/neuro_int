@@ -454,24 +454,6 @@ class OnnxHands:
         return None
 
     @staticmethod
-    def _spread_ok(
-        points: list[tuple[float, float]],
-        rect: list[float],
-        frame_w: int,
-        frame_h: int,
-    ) -> bool:
-        """The landmark cloud must actually fill its crop (scale-free).
-
-        A collapsed blob spans a fraction of the palm box; a real hand
-        fills most of it (measured 0.6-0.9 on live frames, collapsed
-        templates well below 0.35).
-        """
-        xs = [p[0] * frame_w for p in points]
-        ys = [p[1] * frame_h for p in points]
-        diag = hypot(max(xs) - min(xs), max(ys) - min(ys))
-        return diag >= 0.35 * rect[2]
-
-    @staticmethod
     def _cluster_filter(rects: list[list[float]]) -> list[list[float]]:
         """Drop boxes in crowded clusters (the model fires all over a face)."""
         keep: list[list[float]] = []
@@ -818,7 +800,7 @@ class OnnxHands:
                     self._lock_seen = now_s
                     suspect = True
             out = self._landmark_smart(frame_bgr, rect)
-            if out is None or not self._spread_ok(out[0], rect, image_w, image_h):
+            if out is None:
                 continue
             pinch = is_pinch(out[0])
             if suspect and self._lock is not None:

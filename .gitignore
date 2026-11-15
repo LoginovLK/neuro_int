@@ -42,3 +42,6 @@ Thumbs.db
 
 # ---- Camera calibration local profiles ----
 configs/local/
+
+# ---- Models (downloaded separately, up to 350MB) ----
+models/*.onnx
