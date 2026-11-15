@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 # SimCC decode: heatmaps are split at 2x the input resolution.
 SIMCC_SPLIT = 2.0
 PERSON_THR = 0.35
-KPT_THR = 0.30
+KPT_THR = 0.50   # SimCC logits (RAW-input models): visible parts score 1..8
 # COCO-WholeBody: left hand keypoints 91..111, right hand 112..132.
 LEFT_HAND = slice(91, 112)
 RIGHT_HAND = slice(112, 133)
@@ -98,6 +98,7 @@ class DWPoseHands:
         self._tip_hist: deque[tuple[float, float, float]] = deque()
         self._lock: tuple[float, float, float, float] | None = None
         self._lock_seen = 0.0
+        self._last_diag = 0.0
 
     # ---------------- detector ----------------
 
@@ -110,7 +111,10 @@ class DWPoseHands:
         resized = cv2.resize(frame_bgr, (nw, nh))
         padded = np.full((dh, dw, 3), 114, np.uint8)
         padded[:nh, :nw] = resized
-        blob = padded[..., ::-1].transpose(2, 0, 1)[None].astype(np.float32) / 255.0
+        blob = padded[..., ::-1].transpose(2, 0, 1)[None].astype(np.float32)
+        # yzd-v DWPose ONNX exports carry their own normalization INSIDE the
+        # graph: the input is RAW 0..255 (verified: /255 gives person score
+        # 0.00, raw 0..255 gives 0.94 on the same frame).
 
         raw = self._det.run(self._det_out, {self._det_in: blob})[0][0]  # [8400, 85]
 
@@ -180,7 +184,8 @@ class DWPoseHands:
         argmax — they are separate 1D distributions per keypoint.
         """
         crop, affine = self._affine_crop(frame_bgr, bbox)
-        blob = crop[..., ::-1].transpose(2, 0, 1)[None].astype(np.float32) / 255.0
+        blob = crop[..., ::-1].transpose(2, 0, 1)[None].astype(np.float32)
+        # RAW 0..255 input, same as the detector (normalization inside graph).
         simcc_x, simcc_y = self._pose.run(self._pose_out, {self._pose_in: blob})
         val_x, x_loc = np.max(simcc_x[0], axis=1), np.argmax(simcc_x[0], axis=1)
         val_y, y_loc = np.max(simcc_y[0], axis=1), np.argmax(simcc_y[0], axis=1)
@@ -293,9 +298,13 @@ class DWPoseHands:
         """Full frame BGR -> [(21 normalized points, handedness, score)]."""
         image_h, image_w = frame_bgr.shape[:2]
         now_s = time.monotonic()
+        diag_due = now_s - self._last_diag >= 5.0
 
         persons = self._detect_persons(frame_bgr)
         if not persons:
+            if diag_due:
+                self._last_diag = now_s
+                logger.info("diag: no person detected")
             self._shape = None
             self.reset_filters()
             return []
@@ -319,7 +328,19 @@ class DWPoseHands:
             candidates.append(
                 (float(visible.mean()), handed, pts21, float(visible.mean()))
             )
+        if diag_due:
+            self._last_diag = now_s
+            logger.info(
+                "diag: persons %d  handL vis %d (mean %.2f)  handR vis %d (mean %.2f)",
+                len(persons),
+                int((scores[LEFT_HAND] > KPT_THR).sum()),
+                float(scores[LEFT_HAND].mean()),
+                int((scores[RIGHT_HAND] > KPT_THR).sum()),
+                float(scores[RIGHT_HAND].mean()),
+            )
         if not candidates:
+            if diag_due:
+                logger.info("diag: person found, no hand passes the gate")
             self._shape = None
             self.reset_filters()
             return []

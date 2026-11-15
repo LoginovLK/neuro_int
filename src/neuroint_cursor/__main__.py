@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import logging.handlers
 import time
 from pathlib import Path
 
@@ -41,7 +42,16 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    log_dir = Path(__file__).resolve().parents[2] / "logs"
+    log_dir.mkdir(exist_ok=True)
+    file_handler = logging.handlers.RotatingFileHandler(
+        log_dir / "neuroint.log", maxBytes=2_000_000, backupCount=3, encoding="utf-8"
+    )
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        handlers=[logging.StreamHandler(), file_handler],
+    )
     args = parse_args()
     cfg = Settings.load()
     if args.no_window:
