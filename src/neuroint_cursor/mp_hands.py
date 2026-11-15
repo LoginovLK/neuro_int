@@ -23,7 +23,7 @@ from statistics import median
 import cv2
 import numpy as np
 
-from neuroint_cursor.pose import is_pinch, pinch_center
+from neuroint_cursor.pose import is_pinch, is_zero, pinch_center
 from neuroint_cursor.smoothing import PointFilter2D
 
 logger = logging.getLogger(__name__)
@@ -36,7 +36,7 @@ SHAPE_REFIT = 0.55
 # changes, only the tips move (the palm stays), the all-point median never
 # reached the threshold and the old pose stuck until the hand left the
 # frame (Lev's report)
-TIPS_REFIT = 0.55
+TIPS_REFIT = 0.40
 TIPS = (8, 12, 16, 20)
 # coast: when tracking drops (fast swipe, blur) keep the last skeleton and
 # carry it along the last bundle velocity instead of blinking off and
@@ -126,7 +126,7 @@ class MediaPipeHands:
 
     def _shape_apply(
         self, raw: list[tuple[float, float]], now_s: float,
-        image_w: int, image_h: int,
+        image_w: int, image_h: int, force_refit: bool = False,
     ) -> list[tuple[float, float]]:
         """Frozen skeleton, rigidly re-anchored by FILTERED parameters."""
         px = [(x * image_w, y * image_h) for x, y in raw]
@@ -134,7 +134,7 @@ class MediaPipeHands:
         if hand < 8.0:
             return raw
         ang = atan2(px[9][1] - px[0][1], px[9][0] - px[0][0])
-        if self._shape is None:
+        if force_refit or self._shape is None:
             self._shape = (
                 [((p[0] - px[0][0]) / hand, (p[1] - px[0][1]) / hand) for p in px],
                 ang,
@@ -322,6 +322,17 @@ class MediaPipeHands:
         score, handed, pts21 = max(candidates, key=lambda c: c[0])
 
         shaped = self._shape_apply(pts21, now_s, image_w, image_h)
+        # gesture-change fix (Lev): if the RECOGNIZED gesture differs
+        # between the raw cloud and the frozen shape, the pose actually
+        # changed - re-freeze from the live cloud this same frame. The
+        # tip-divergence threshold alone missed partial switches (that
+        # is why gestures used to switch only through an open palm).
+        if self._shape is not None and (
+            is_pinch(pts21) != is_pinch(shaped) or is_zero(pts21) != is_zero(shaped)
+        ):
+            shaped = self._shape_apply(
+                pts21, now_s, image_w, image_h, force_refit=True
+            )
         points = self._smooth(shaped, now_s)
 
         # bundle velocity for coasting
