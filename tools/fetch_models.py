@@ -51,7 +51,7 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001 - report and fail the target
         print(f"FAILED: {exc}", file=sys.stderr)
         return 1
-    print("models ready — make run")
+    print("models ready")
     return 0
 
 

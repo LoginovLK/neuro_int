@@ -91,9 +91,10 @@ DWPose files are unused research artifacts.
     cd neuro_int
     python -m venv .venv-edge
     .venv-edge\Scripts\pip install -r requirements.txt
-    make models      :: downloads models/gesture_recognizer.task + face gate
-    make run
+    make run         :: models download automatically on first run
 
-`config.json` (personal sensitivity) and `captures/`/`logs/` are
-gitignored — copy `config.json` from the old machine or start from the
-`config.example.json` defaults.
+`make models` also runs standalone. `config.json` is tracked in git
+(it holds only settings — sensitivity, smoothing; no secrets), so the
+tuned values travel with the repo: after changing sensitivity live
+(+/- keys) commit and push to carry it to the other machine.
+`captures/`/`logs/` stay gitignored (local diagnostics only).
