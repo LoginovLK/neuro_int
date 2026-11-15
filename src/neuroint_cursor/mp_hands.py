@@ -80,6 +80,10 @@ class MediaPipeHands:
                 )
             except Exception as exc:  # noqa: BLE001 - gate is optional
                 logger.warning("face gate unavailable: %s", exc)
+        self._face_cache: tuple[float, list[tuple[float, float, float, float]]] = (
+            0.0,
+            [],
+        )
 
         self._filters: list[PointFilter2D] | None = None
         self._shape: tuple[list[tuple[float, float]], float] | None = None
@@ -101,16 +105,24 @@ class MediaPipeHands:
     # ---------------- helpers (carried over) ----------------
 
     def _face_boxes(self, frame_bgr: np.ndarray) -> list[tuple[float, float, float, float]]:
+        """YuNet, cached for 150ms: a face does not jump frame to frame,
+        and a per-frame CPU detector steals ~10ms from the hot loop."""
         if self._face_det is None:
             return []
+        now_s = time.monotonic()
+        if now_s - self._face_cache[0] < 0.15:
+            return self._face_cache[1]
         image_h, image_w = frame_bgr.shape[:2]
         small = cv2.resize(frame_bgr, (640, 360))
         self._face_det.setInputSize((640, 360))
         _, faces = self._face_det.detect(small)
         if faces is None:
-            return []
-        sx, sy = image_w / 640.0, image_h / 360.0
-        return [(f[0] * sx, f[1] * sy, f[2] * sx, f[3] * sy) for f in faces]
+            out: list[tuple[float, float, float, float]] = []
+        else:
+            sx, sy = image_w / 640.0, image_h / 360.0
+            out = [(f[0] * sx, f[1] * sy, f[2] * sx, f[3] * sy) for f in faces]
+        self._face_cache = (now_s, out)
+        return out
 
     def _shape_apply(
         self, raw: list[tuple[float, float]], now_s: float,

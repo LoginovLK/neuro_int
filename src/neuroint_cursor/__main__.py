@@ -48,10 +48,15 @@ def main() -> int:
     file_handler = logging.handlers.RotatingFileHandler(
         log_dir / "neuroint.log", maxBytes=2_000_000, backupCount=3, encoding="utf-8"
     )
+    # non-blocking: disk writes go through a background queue - a sync
+    # flush inside the 30fps loop causes periodic cursor freezes
+    queue = logging.handlers.QueueHandler(file_handler)
+    listener = logging.handlers.QueueListener(queue, file_handler, respect_handler_level=False)
+    listener.start()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
-        handlers=[logging.StreamHandler(), file_handler],
+        handlers=[queue],
     )
     args = parse_args()
     cfg = Settings.load()
@@ -124,9 +129,12 @@ def main() -> int:
                 results = hands.detect(frame, prefer_pinch=active)
                 result = results[0] if results else None
                 # coast keeps the skeleton visible but is NOT a hand:
-                # control treats stale results as "no hand" so the pinch
-                # releases when the hand leaves the frame
-                fresh = (now - getattr(hands, "_last_fresh", now)) <= 0.10
+                # control treats stale results as "no hand". The window
+                # must cover MediaPipe's own 1-3 frame re-detection gaps
+                # (measured ~100ms) or the cursor freezes every few
+                # seconds; a real hand-out still releases via the
+                # off-debounce right after.
+                fresh = (now - getattr(hands, "_last_fresh", now)) <= 0.15
 
                 pointing = fresh and result is not None and is_pinch(result[0])
                 # Debounce both edges: ON after a few straight-pointing frames,
@@ -198,6 +206,7 @@ def main() -> int:
         pass
     finally:
         cam.close()
+        listener.stop()
         if win is not None:
             cv2.destroyAllWindows()
 
