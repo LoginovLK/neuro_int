@@ -24,7 +24,7 @@ from neuroint_cursor.config import Settings
 from neuroint_cursor.cursor import CursorActuator
 from neuroint_cursor.hands import OnnxHands
 from neuroint_cursor.overlay import draw
-from neuroint_cursor.pose import is_pinch, pinch_center
+from neuroint_cursor.pose import is_pinch, is_zero, pinch_center
 
 logger = logging.getLogger("neuroint_cursor")
 
@@ -120,6 +120,8 @@ def main() -> int:
     frames = detected = pointing_frames = moved = 0
     active = False
     on_counter = off_counter = 0
+    zero_counter = 0
+    zero_fired = False
     fps_t = time.monotonic()
     fps_frames = 0
     fps = 0.0
@@ -153,23 +155,41 @@ def main() -> int:
                 fresh = (now - getattr(hands, "_last_fresh", now)) <= 0.15
 
                 pointing = fresh and result is not None and is_pinch(result[0])
-                # Debounce both edges: ON after a few straight-pointing frames,
-                # OFF only after a grace period (single dropped detections must
-                # not stutter the cursor).
+                # the zero gesture is a one-shot command, never control
+                zero = fresh and result is not None and is_zero(result[0])
+                if zero:
+                    pointing = False
+                zero_counter = zero_counter + 1 if zero else 0
+                if not zero:
+                    zero_fired = False
+
+                # Debounce both edges: ON after a few bundle frames,
+                # OFF only after a grace period (single dropped detections
+                # must not stutter the cursor).
                 on_counter = on_counter + 1 if pointing else 0
                 off_counter = off_counter + 1 if not pointing else 0
                 if not active and on_counter >= cfg.debounce_frames:
                     active = True
-                    act.reset()
+                    bx, by = pinch_center(result[0])  # hand's zero point
+                    act.reset(bx, by)
                 elif active and off_counter >= cfg.debounce_off_frames:
                     active = False
 
+                # zero gesture: park the cursor in the screen center once
+                # per gesture (edge-triggered)
+                if zero_counter == cfg.debounce_frames and not zero_fired:
+                    act.center()
+                    zero_fired = True
+                    active = False
+                    on_counter = 0
+                    logger.info("zero gesture: cursor centered")
+
                 if active and result is not None:
                     fx, fy = pinch_center(result[0])  # the bundle center
-                    sx, sy = act.mapper.map(fx, fy)
                     if args.dry:
                         moved += 1
                         if moved % 15 == 1:
+                            sx, sy = act.move(fx, fy, now)
                             logger.info("dry: cursor would move to %dx%d", sx, sy)
                     else:
                         act.move(fx, fy, now)

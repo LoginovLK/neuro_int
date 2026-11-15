@@ -127,6 +127,46 @@ def is_pinch(
     return _hull_area(pts) <= max_hull * hand * hand
 
 
+def palm_center(pts: list[tuple[float, float]]) -> tuple[float, float]:
+    """Center of the palm: mean of wrist, index MCP, pinky MCP."""
+    px = (pts[0][0] + pts[5][0] + pts[17][0]) / 3
+    py = (pts[0][1] + pts[5][1] + pts[17][1]) / 3
+    return px, py
+
+
+def is_zero(
+    pts: list[tuple[float, float]],
+    max_hull: float = 1.0,
+    max_tip_to_palm: float = 0.75,
+    min_curled: int = 3,
+) -> bool:
+    """The 'zero' pose: fingers rolled into tubes toward the palm.
+
+    Physically opposite of the bundle: the tips FOLD BACK toward the
+    palm center (a bundle throws them forward past the palm outline).
+    Gates, palm-length units: at least 3 fingers curled (tip closer to
+    the wrist than its PIP), the tip cluster sits within 0.75 palm
+    lengths of the palm center, and the hand stays compact. Zero and
+    bundle are mutually exclusive by construction (bundle needs reach
+    >= 0.9, zero caps it at <= 0.75).
+    """
+    hand = _dist(pts[WRIST], pts[MIDDLE_MCP])
+    if hand < 1e-6:
+        return False
+    curled = sum(
+        1
+        for tip, pip, _mcp in FINGERS.values()
+        if _dist(pts[WRIST], pts[tip]) < _dist(pts[WRIST], pts[pip]) * 1.05
+    )
+    if curled < min_curled:
+        return False
+    cx, cy = pinch_center(pts)
+    px, py = palm_center(pts)
+    if _dist((cx, cy), (px, py)) > max_tip_to_palm * hand:
+        return False
+    return _hull_area(pts) <= max_hull * hand * hand
+
+
 def palm_ratio(pts: list[tuple[float, float]]) -> float | None:
     """Palm length (wrist -> middle MCP) over palm width (index -> pinky MCP).
 
