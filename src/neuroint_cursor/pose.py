@@ -142,7 +142,7 @@ def extended_finger_count(pts: list[tuple[float, float]]) -> int:
     closed hand at 0 (control).
     """
     n = 0
-    for name, (tip, pip, mcp) in FINGERS.items():
+    for _name, (tip, pip, mcp) in FINGERS.items():
         if _dist(pts[WRIST], pts[tip]) <= _dist(pts[WRIST], pts[pip]) * 1.25:
             continue
         if _bend_deg(pts[tip], pts[pip], pts[mcp]) > 45.0:
