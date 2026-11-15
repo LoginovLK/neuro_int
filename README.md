@@ -75,7 +75,9 @@ ONNX-декод с фиксами, One Euro) перенесены дословн
 | `yolox_l.onnx` (216MB) | [yzd-v/DWPose](https://huggingface.co/yzd-v/DWPose) | person detector (DWPose backend) |
 | `dw-ll_ucoco_384.onnx` (134MB) | [yzd-v/DWPose](https://huggingface.co/yzd-v/DWPose) | RTMPose wholebody, 133 keypoints (DWPose backend) |
 | `face_detection_yunet_2023mar.onnx` (232KB) | [opencv_zoo](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet) | face gate (legacy backend) |
-| `palm_detection_full_inf_post_192x192.onnx`, `hand_landmark_sparse_Nx3x224x224.onnx` | [PINTO0309 hand-gesture-recognition](https://github.com/PINTO0309/hand-gesture-recognition-using-onnx) | legacy palm+landmark backend |
+| `hand_landmarker.task` (7.8MB) | [MediaPipe hand landmarker](https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task) | **primary backend** (official Google pipeline) |
+| `yolox_l.onnx` / `dw-ll_ucoco_384.onnx` are optional research artifacts (DWPose experiment, unused at runtime) | | |
+| `palm_detection_full_inf_post_192x192.onnx`, `hand_landmark_sparse_Nx3x224x224.onnx` | [PINTO0309 hand-gesture-recognition](https://github.com/PINTO0309/hand-gesture-recognition-using-onnx) | fallback backend (no mediapipe package) |
 
 The DWPose backend activates automatically when `yolox_l.onnx` and
 `dw-ll_ucoco_384.onnx` are present; otherwise the legacy palm+landmark

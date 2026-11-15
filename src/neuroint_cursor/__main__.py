@@ -29,6 +29,7 @@ MODELS = Path(__file__).resolve().parents[2] / "models"
 PALM_MODEL = MODELS / "palm_detection_full_inf_post_192x192.onnx"
 LANDMARK_MODEL = MODELS / "hand_landmark_sparse_Nx3x224x224.onnx"
 FACE_MODEL = MODELS / "face_detection_yunet_2023mar.onnx"
+MP_MODEL = MODELS / "hand_landmarker.task"
 DWPOSE_DET = MODELS / "yolox_l.onnx"
 DWPOSE_POSE = MODELS / "dw-ll_ucoco_384.onnx"
 
@@ -58,21 +59,26 @@ def main() -> int:
         cfg.debug_window = False
 
     cam = Camera(cfg.camera_index, cfg.width, cfg.height, cfg.fps, cfg.mirror)
-    # palm-first pipeline (PINTO palm every frame + dedicated 224 hand
-    # landmark): measured better than the DWPose wholebody experiment -
-    # wholebody models hallucinate confident hands on textures where no
-    # hand exists (chair 22-38 logits vs real raised hand 0.6-1.1).
-    # dwpose_hands.py stays in the repo as a research artifact.
-    hands = OnnxHands(
-        PALM_MODEL,
-        LANDMARK_MODEL,
-        score_threshold=cfg.palm_score_threshold,
-        class_score_threshold=cfg.landmark_score_threshold,
-        tracking=cfg.tracking,
-        clahe=cfg.clahe,
-        face_model=FACE_MODEL,
-    )
-    logger.info("backend: palm-first (pinto palm + 224 landmark, yunet gate)")
+    try:
+        # OFFICIAL MediaPipe hand landmarker (Google's own palm-detect ->
+        # landmark-track pipeline, preprocessing matched to training).
+        # The manually ported ONNX models produced cramped, twitchy
+        # skeletons; this is the reference quality Lev's original v1 had.
+        from neuroint_cursor.mp_hands import MediaPipeHands
+
+        hands = MediaPipeHands(MP_MODEL, face_model=FACE_MODEL)  # type: ignore[assignment]
+        logger.info("backend: mediapipe hand landmarker (official)")
+    except ImportError:
+        hands = OnnxHands(
+            PALM_MODEL,
+            LANDMARK_MODEL,
+            score_threshold=cfg.palm_score_threshold,
+            class_score_threshold=cfg.landmark_score_threshold,
+            tracking=cfg.tracking,
+            clahe=cfg.clahe,
+            face_model=FACE_MODEL,
+        )
+        logger.info("backend: palm-first onnx (mediapipe package not installed)")
     act = CursorActuator(cfg.sensitivity, cfg.min_cutoff, cfg.beta)
     logger.info(
         "screen %dx%d  full-frame mapping",

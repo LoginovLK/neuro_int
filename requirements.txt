@@ -1,0 +1,7 @@
+opencv-python
+numpy
+onnxruntime-directml
+pynput
+mediapipe
+# pip install -r requirements.txt
+# models are downloaded separately into models/ (see table in README)
