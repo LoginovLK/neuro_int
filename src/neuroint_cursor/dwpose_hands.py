@@ -173,14 +173,20 @@ class DWPoseHands:
     def _run_pose(
         self, frame_bgr: np.ndarray, bbox: tuple[float, float, float, float]
     ) -> tuple[np.ndarray, np.ndarray]:
-        """133 keypoints in frame pixels + per-keypoint scores [0..1]."""
+        """133 keypoints in frame pixels + per-keypoint scores [0..1].
+
+        SimCC decode (rtmlib reference): the X coordinate comes from the
+        x-grid argmax and the Y coordinate INDEPENDENTLY from the y-grid
+        argmax — they are separate 1D distributions per keypoint.
+        """
         crop, affine = self._affine_crop(frame_bgr, bbox)
         blob = crop[..., ::-1].transpose(2, 0, 1)[None].astype(np.float32) / 255.0
         simcc_x, simcc_y = self._pose.run(self._pose_out, {self._pose_in: blob})
         val_x, x_loc = np.max(simcc_x[0], axis=1), np.argmax(simcc_x[0], axis=1)
         val_y, y_loc = np.max(simcc_y[0], axis=1), np.argmax(simcc_y[0], axis=1)
-        locs = np.where(val_x > val_y, x_loc, y_loc).astype(np.float32)
-        pts = locs / SIMCC_SPLIT  # crop pixels
+        pts = np.stack(
+            [x_loc.astype(np.float32), y_loc.astype(np.float32)], axis=1
+        ) / SIMCC_SPLIT  # crop pixels
         ones = np.ones((133, 1), np.float32)
         inv = cv2.invertAffineTransform(affine)
         pts_img = (np.hstack([pts, ones]) @ inv.T).astype(np.float32)
