@@ -1,0 +1,17 @@
+{
+  "camera_index": 0,
+  "width": 1280,
+  "height": 720,
+  "fps": 30,
+  "mirror": true,
+  "sensitivity": 3.0,
+  "min_cutoff": 2.0,
+  "beta": 0.01,
+  "palm_score_threshold": 0.4,
+  "landmark_score_threshold": 0.25,
+  "debounce_frames": 2,
+  "debounce_off_frames": 10,
+  "tracking": true,
+  "clahe": true,
+  "debug_window": true
+}

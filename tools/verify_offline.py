@@ -16,7 +16,7 @@ from pathlib import Path
 import cv2
 
 from neuroint_cursor.hands import OnnxHands
-from neuroint_cursor.pose import is_pointing
+from neuroint_cursor.pose import is_pinch
 
 ROOT = Path(__file__).resolve().parents[1]
 MODELS = ROOT / "models"
@@ -59,7 +59,7 @@ def main() -> None:
         rec.update(
             detected=True,
             score=round(score, 3),
-            pointing=is_pointing(pts),
+            pointing=is_pinch(pts),
             tip0=[round(tip0[0], 1), round(tip0[1], 1)],
         )
 

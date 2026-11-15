@@ -20,7 +20,7 @@ from neuroint_cursor.config import Settings
 from neuroint_cursor.cursor import CursorActuator
 from neuroint_cursor.hands import OnnxHands
 from neuroint_cursor.overlay import draw
-from neuroint_cursor.pose import is_pointing
+from neuroint_cursor.pose import is_pinch, pinch_center
 
 logger = logging.getLogger("neuroint_cursor")
 
@@ -98,12 +98,12 @@ def main() -> int:
                 last_seq = seq
                 now = time.monotonic()
 
-                results = hands.detect(frame, prefer_pointing=active)
+                results = hands.detect(frame, prefer_pinch=active)
                 result = results[0] if results else None
                 if not results:
                     hands.reset_smoothing()
 
-                pointing = result is not None and is_pointing(result[0])
+                pointing = result is not None and is_pinch(result[0])
                 # Debounce both edges: ON after a few straight-pointing frames,
                 # OFF only after a grace period (single dropped detections must
                 # not stutter the cursor).
@@ -116,7 +116,7 @@ def main() -> int:
                     active = False
 
                 if active and result is not None:
-                    fx, fy = result[0][8]  # index fingertip (already smoothed)
+                    fx, fy = pinch_center(result[0])  # the bundle center
                     sx, sy = act.mapper.map(fx, fy)
                     if args.dry:
                         moved += 1

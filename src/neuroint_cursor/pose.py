@@ -1,9 +1,8 @@
-"""Pointing pose: index finger raised, the rest curled (the "pointing" pose).
+"""Hand poses: the "bundle" (pinch) engages the cursor.
 
-Rotation-invariant: a finger counts as straight when its tip is farther
-from the wrist than its PIP joint AND the tip-pip-mcp chain is not bent.
-An open palm does NOT count (all fingers extended) — only the pointing
-pose engages cursor control.
+The bundle: all four fingertips gathered into one point — comfortable to
+hold (no extended finger to fatigue). Scale-free checks, units of the
+palm length (wrist -> middle MCP).
 """
 
 from __future__ import annotations
@@ -15,6 +14,8 @@ INDEX_MCP, INDEX_PIP, INDEX_TIP = 5, 6, 8
 MIDDLE_MCP, MIDDLE_PIP, MIDDLE_TIP = 9, 10, 12
 RING_MCP, RING_PIP, RING_TIP = 13, 14, 16
 PINKY_MCP, PINKY_PIP, PINKY_TIP = 17, 18, 20
+
+TIP_IDS = (INDEX_TIP, MIDDLE_TIP, RING_TIP, PINKY_TIP)
 
 FINGERS: dict[str, tuple[int, int, int]] = {
     "index": (INDEX_TIP, INDEX_PIP, INDEX_MCP),
@@ -63,30 +64,39 @@ def finger_states(pts: list[tuple[float, float]]) -> dict[str, bool]:
     return {name: finger_extended(pts, *ids) for name, ids in FINGERS.items()}
 
 
-def is_pointing(pts: list[tuple[float, float]]) -> bool:
-    """The pointing pose: index straight, middle folded, index the extremum.
+def pinch_center(pts: list[tuple[float, float]]) -> tuple[float, float]:
+    """Center of the fingertip bundle — the cursor control point."""
+    xs = sum(pts[i][0] for i in TIP_IDS)
+    ys = sum(pts[i][1] for i in TIP_IDS)
+    return xs / len(TIP_IDS), ys / len(TIP_IDS)
 
-    Middle alone separates ☝ from ✌ and the open palm. Ring/pinky are
-    NOT state-checked: on a hand seen edge-on (knuckles toward the
-    camera, the dark-hoodie case) they misread as extended — the face
-    false positives that motivated the strict rule are already rejected
-    by the palm-cluster filter before this check runs.
 
-    Third condition — the physical invariant of ☝: the index TIP is the
-    farthest fingertip from the wrist (it is the extended one). Junk
-    hallucinations that pass the two state checks almost always put
-    some other fingertip farther out; a real pointing hand never does
-    (0.85 tolerance for edge-on hands where a folded-tip estimate can
-    creep slightly past).
+def is_pinch(
+    pts: list[tuple[float, float]], max_radius: float = 0.32, min_reach: float = 0.9
+) -> bool:
+    """The bundle pose: four fingertips gathered into one point.
+
+    Scale-free, in palm-length units (wrist -> middle MCP):
+    - cluster radius <= 0.32 (an open palm spreads ~0.45+, fails);
+    - the bundle sits AWAY from the wrist, >= 0.9 palm lengths;
+    - >= 3 fingers have the tip FARTHER from the wrist than the PIP —
+      a fist folds the tips back onto the knuckles (tip closer than
+      pip) and fails no matter how tight the cluster is.
     """
-    state = finger_states(pts)
-    if not (state["index"] and not state["middle"]):
+    hand = _dist(pts[WRIST], pts[MIDDLE_MCP])
+    if hand < 1e-6:
         return False
-    di = _dist(pts[WRIST], pts[INDEX_TIP])
-    farthest = max(
-        _dist(pts[WRIST], pts[t]) for t in (MIDDLE_TIP, RING_TIP, PINKY_TIP)
+    cx, cy = pinch_center(pts)
+    if _dist(pts[WRIST], (cx, cy)) < min_reach * hand:
+        return False
+    if max(_dist(pts[i], (cx, cy)) for i in TIP_IDS) > max_radius * hand:
+        return False
+    extended = sum(
+        1
+        for tip, pip, _mcp in FINGERS.values()
+        if _dist(pts[WRIST], pts[tip]) > _dist(pts[WRIST], pts[pip])
     )
-    return di >= 0.85 * farthest
+    return extended >= 3
 
 
 def palm_ratio(pts: list[tuple[float, float]]) -> float | None:

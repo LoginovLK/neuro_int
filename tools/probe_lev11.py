@@ -15,7 +15,7 @@ from pathlib import Path
 import cv2
 
 from neuroint_cursor.hands import OnnxHands
-from neuroint_cursor.pose import finger_states, is_pointing, palm_ratio
+from neuroint_cursor.pose import finger_states, is_pinch, palm_ratio
 
 ROOT = Path(__file__).resolve().parents[1]
 MODELS = ROOT / "models"
@@ -80,7 +80,7 @@ def main() -> None:
                     "rect": [round(v, 1) for v in rect],
                     "landmark_score": round(score, 3),
                     "handed": handed,
-                    "pointing": is_pointing(pts),
+                    "pointing": is_pinch(pts),
                     "states": finger_states(pts),
                     "ms": round(ms, 1),
                     **geom(pts),

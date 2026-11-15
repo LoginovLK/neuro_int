@@ -18,7 +18,7 @@ import cv2
 import numpy as np
 
 from neuroint_cursor.hands import OnnxHands
-from neuroint_cursor.pose import is_pointing
+from neuroint_cursor.pose import is_pinch
 
 ROOT = Path(__file__).resolve().parents[1]
 MODELS = ROOT / "models"
@@ -43,7 +43,7 @@ def main() -> None:
             r = hands.detect(f)
             if r:
                 dets += 1
-                last_det = is_pointing(r[0][0])
+                last_det = is_pinch(r[0][0])
         report[label] = {
             "detections": dets,
             "of": frames,

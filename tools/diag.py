@@ -16,7 +16,7 @@ import cv2
 
 from neuroint_cursor.camera import Camera
 from neuroint_cursor.hands import OnnxHands, _rotate_and_crop
-from neuroint_cursor.pose import is_pointing
+from neuroint_cursor.pose import is_pinch
 
 MODELS = Path(__file__).resolve().parents[1] / "models"
 OUT = Path(__file__).resolve().parents[1] / "captures"
@@ -65,7 +65,7 @@ def main() -> None:
             rec = {
                 "kind": "det",
                 "score": round(score, 3),
-                "pointing": is_pointing(pts),
+                "pointing": is_pinch(pts),
                 "rect": [round(v) for v in rect],
                 **_geom(pts),
             }

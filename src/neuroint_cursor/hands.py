@@ -17,8 +17,8 @@ these exact models (researched from the sources, not invented):
   scale 2.0 / shift_y -0.1 / square_long, ported verbatim in tracking.py)
   with a sticky rotation fix for the model's squash instability.
 - Crowded palm-box clusters are dropped (the palm model fires all over a
-  face), a still non-pointing object is quarantined, and while the
-  cursor is engaged a far non-pointing candidate cannot steal the hand.
+  face), a still non-pinch object is quarantined, and while the
+  cursor is engaged a far non-pinch candidate cannot steal the hand.
 
 Crop->frame decode is the exact inverse of the rotated-crop transform
 (rotation included; verified empirically with a synthetic marker) — a
@@ -49,7 +49,7 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 
-from neuroint_cursor.pose import is_pointing, palm_sane
+from neuroint_cursor.pose import is_pinch, palm_sane
 from neuroint_cursor.smoothing import PointFilter2D
 from neuroint_cursor.tracking import (
     TRACK_MISS_LIMIT,
@@ -69,15 +69,14 @@ HAND_CONNECTIONS = [
     (0, 17),
 ]
 
-# Bonus for a pointing candidate when CHOOSING among several acquisition
-# candidates (MediaPipe has no such preference; the cursor use case does —
-# the pointing hand must win over a face anchor at equal scores).
-POINTING_BONUS = 0.15
+# Bonus for a pinch candidate when CHOOSING among several acquisition
+# candidates: the bundle hand must win over a junk anchor at equal scores.
+PINCH_BONUS = 0.15
 
 # Static-object rejection: shelf junk / furniture edges get detected as a
 # palm and then tracked forever. A real hand always micro-sways, and a
-# hand HELD deliberately still is in pointing pose (in use). So: an
-# object that stays put for STATIC_SECONDS while never pointing is not
+# hand HELD deliberately still is in pinch pose (in use). So: an
+# object that stays put for STATIC_SECONDS while never pinching is not
 # a hand — drop it and remember a quarantine ZONE at that spot.
 # "Stays put" = the rect center hovers near the window median OR the
 # boxes keep overlapping (IoU): on textured junk the palm box hops
@@ -85,7 +84,7 @@ POINTING_BONUS = 0.15
 # boxes still cover the same object — measured live (the skeleton that
 # would not go away). Zones are PERSISTENT: the old 8s expiry made the
 # junk re-appear in a 2s-visible/8s-hidden cycle; a zone is cleared only
-# by a POINTING candidate at that spot (intentional use) or bypassed by
+# by a PINCH candidate at that spot (intentional use) or bypassed by
 # a big close hand.
 STATIC_SECONDS = 2.0
 STATIC_RADIUS = 0.16      # median-center radius, fraction of min(frame_w, frame_h)
@@ -93,19 +92,27 @@ STATIC_IOU = 0.4          # median box overlap that also counts as "same object"
 QUARANTINE_RADIUS = 0.08  # zone rejection radius, fraction of min(frame_w, frame_h)
 ZONE_LIMIT = 6            # FIFO cap on remembered zones
 
-# Still-POINTING sticker: a hallucination that reads pointing forever is
-# exempt from the never-pointing quarantine — and it can even ENGAGE the
+# Shape lock (Lev's architecture): the landmark SHAPE is frozen once and
+# re-anchored every frame on the live wrist/rotation/scale — the bones
+# do not jitter frame to frame, only the rigid transform follows the
+# hand. The shape re-freezes only when the live landmark cloud diverges
+# from the rigid model by this fraction of the hand size (the pose
+# actually changed).
+SHAPE_REFIT = 0.35
+
+# Still-PINCH sticker: a hallucination that reads pinch forever is
+# exempt from the never-pinch quarantine — and it can even ENGAGE the
 # cursor (measured live: "POINTING - cursor follows finger" on a bed
 # corner). The discriminator a single frame cannot fake: a hand IN USE
 # moves the cursor, so its fingertip wanders; a sticker is frozen. After
-# STILL_POINTING_SECONDS of continuous pointing with a frozen fingertip
+# STILL_PINCH_SECONDS of continuous pinch with a frozen fingertip
 # (or a frozen box) the spot is locked out: control drops, candidates
 # there are rejected. The lock opens when the box moves away / vanishes
-# for LOCK_UNLOCK_SECONDS, a big close hand arrives, or a pointing
+# for LOCK_UNLOCK_SECONDS, a big close hand arrives, or a pinch
 # candidate with a DIFFERENT fingertip appears (a real hand coming to
 # that corner; the sticker's tip is frozen within the spread bound, so
 # it can never satisfy the tip-difference test itself).
-STILL_POINTING_SECONDS = 5.0
+STILL_PINCH_SECONDS = 5.0
 STILL_TIP_SPREAD = 0.02   # frozen-tip radius, fraction of min(frame_w, frame_h)
 LOCK_TIP_DIFF = 0.06      # tip distance that proves "a different hand"
 LOCK_IOU = 0.3            # box overlap that counts as "still at the spot"
@@ -113,7 +120,7 @@ LOCK_UNLOCK_SECONDS = 1.0 # spot unattended this long -> lock opens
 
 # A candidate far from the last hand position (this factor of the last
 # rect size) may not steal the track while the cursor is engaged and it
-# is not pointing.
+# is not pinching.
 RECOVERY_NEAR_FACTOR = 2.0
 
 # Tilted hands: the palm box angle can be tens of degrees off, and the
@@ -256,6 +263,7 @@ class OnnxHands:
         self._rot_fix = 0.0
         self._hist: deque[tuple[float, float, float, float]] = deque()
         self._tip_hist: deque[tuple[float, float, float]] = deque()
+        self._shape: tuple[list[tuple[float, float]], float] | None = None
         self._zones: list[tuple[float, float]] = []
         self._lock: tuple[float, float, float, float, float] | None = None
         self._lock_seen = 0.0
@@ -267,6 +275,7 @@ class OnnxHands:
         self._rot_fix = 0.0
         self._hist.clear()
         self._tip_hist.clear()
+        self._shape = None
         self.reset_smoothing()
 
     def reset_smoothing(self) -> None:
@@ -493,8 +502,8 @@ class OnnxHands:
         return dist <= 0.75 * rect[2]
 
     def _eff(self, out: tuple[list[tuple[float, float]], str, float]) -> float:
-        """Effective score: pointing candidates outscore equal raw anchors."""
-        return out[2] + (POINTING_BONUS if is_pointing(out[0]) else 0.0)
+        """Effective score: pinch candidates outscore equal raw anchors."""
+        return out[2] + (PINCH_BONUS if is_pinch(out[0]) else 0.0)
 
     def _smooth(
         self, raw_points: list[tuple[float, float]], now_s: float
@@ -515,19 +524,64 @@ class OnnxHands:
             )
         ]
 
+    def _shape_apply(
+        self, raw: list[tuple[float, float]], image_w: int, image_h: int
+    ) -> list[tuple[float, float]]:
+        """Freeze the landmark SHAPE, rigidly re-anchor it every frame.
+
+        Lev's architecture: the bones are not re-fit per frame — the
+        frozen shape is translated onto the live wrist and rotated/
+        scaled by the live wrist->middle-MCP transform. Only 3 degrees
+        of freedom follow the CNN, so per-landmark jitter is gone and
+        the skeleton cannot slide. Re-freezes only when the live cloud
+        diverges from the rigid model beyond SHAPE_REFIT (the pose
+        actually changed).
+        """
+        px = [(x * image_w, y * image_h) for x, y in raw]
+        hand = hypot(px[9][0] - px[0][0], px[9][1] - px[0][1])
+        if hand < 8.0:
+            return raw
+        ang = atan2(px[9][1] - px[0][1], px[9][0] - px[0][0])
+        if self._shape is None:
+            self._shape = (
+                [((p[0] - px[0][0]) / hand, (p[1] - px[0][1]) / hand) for p in px],
+                ang,
+            )
+            return raw
+        offsets, ang0 = self._shape
+        d = normalize_radians(ang - ang0)
+        ca, sa = cos(d), sin(d)
+        wx, wy = px[0]
+        emitted = [
+            (wx + hand * (ox * ca - oy * sa), wy + hand * (ox * sa + oy * ca))
+            for ox, oy in offsets
+        ]
+        div = median(
+            hypot(emitted[i][0] - px[i][0], emitted[i][1] - px[i][1])
+            for i in range(21)
+        ) / hand
+        if div > SHAPE_REFIT:
+            # pose change: re-freeze from the live cloud
+            self._shape = (
+                [((p[0] - px[0][0]) / hand, (p[1] - px[0][1]) / hand) for p in px],
+                ang,
+            )
+            return raw
+        return [(ex / image_w, ey / image_h) for ex, ey in emitted]
+
     def _track_tip(
         self,
-        pointing_now: bool,
+        pinch_now: bool,
         raw_points: list[tuple[float, float]],
         now_s: float,
         image_w: int,
         image_h: int,
     ) -> None:
-        """Raw fingertip history for the still-pointing sticker check."""
-        if not pointing_now:
-            self._tip_hist.clear()  # a broken pointing streak resets it
+        """Fingertip history for the still-pinch sticker check."""
+        if not pinch_now:
+            self._tip_hist.clear()  # a broken pinch streak resets it
             return
-        horizon = now_s - STILL_POINTING_SECONDS
+        horizon = now_s - STILL_PINCH_SECONDS
         while self._tip_hist and self._tip_hist[0][0] < horizon:
             self._tip_hist.popleft()
         tip = raw_points[8]
@@ -561,17 +615,17 @@ class OnnxHands:
         now_s: float,
         image_w: int,
         image_h: int,
-        pointing_now: bool,
+        pinch_now: bool,
     ) -> bool:
         """True when the object was just quarantined / locked out."""
         self._hist.append((now_s, rect[0], rect[1], float(rect[2])))
-        horizon = now_s - STILL_POINTING_SECONDS
+        horizon = now_s - STILL_PINCH_SECONDS
         while self._hist and self._hist[0][0] < horizon:
             self._hist.popleft()
         min_dim = min(image_w, image_h)
 
-        # tier 1: still and NEVER pointing for 2s -> persistent zone
-        if not pointing_now:
+        # tier 1: still and NEVER pinching for 2s -> persistent zone
+        if not pinch_now:
             recent = [r for r in self._hist if r[0] >= now_s - STATIC_SECONDS]
             if (
                 len(recent) >= 15
@@ -596,12 +650,12 @@ class OnnxHands:
                     )
                     return True
 
-        # tier 2: still-POINTING sticker (5s frozen fingertip or frozen box)
+        # tier 2: still-PINCH sticker (5s frozen fingertip or frozen box)
         if (
-            pointing_now
+            pinch_now
             and len(self._tip_hist) >= 30
             and self._tip_hist[-1][0] - self._tip_hist[0][0]
-            >= STILL_POINTING_SECONDS * 0.8
+            >= STILL_PINCH_SECONDS * 0.8
         ):
             txs = [x for _, x, _y in self._tip_hist]
             tys = [y for _, _x, y in self._tip_hist]
@@ -615,7 +669,7 @@ class OnnxHands:
                 self._tip_hist.clear()
                 self._drop_track()
                 logger.warning(
-                    "still-pointing sticker locked out at (%.2f, %.2f)",
+                    "still-pinch sticker locked out at (%.2f, %.2f)",
                     rect[0] / image_w,
                     rect[1] / image_h,
                 )
@@ -623,7 +677,7 @@ class OnnxHands:
         return False
 
     def detect(
-        self, frame_bgr: np.ndarray, prefer_pointing: bool = False
+        self, frame_bgr: np.ndarray, prefer_pinch: bool = False
     ) -> list[tuple[list[tuple[float, float]], str, float]]:
         """Full frame BGR -> list of (21 normalized landmarks, handedness, score).
 
@@ -643,8 +697,8 @@ class OnnxHands:
         landmarks (hand_landmarks_to_rect_calculator.cc verbatim, see
         tracking.py) with the sticky rotation fix.
 
-        prefer_pointing: the cursor is engaged — a candidate far from the
-        last hand position and NOT pointing is rejected (a face anchor at
+        prefer_pinch: the cursor is engaged — a candidate far from the
+        last hand position and NOT pinching is rejected (a face anchor at
         frame center must not steal the hand mid-use).
         """
         image_h, image_w = frame_bgr.shape[:2]
@@ -659,17 +713,18 @@ class OnnxHands:
         palm_thr = self._score_threshold
         faces = self._face_boxes(frame_bgr)
         best = self._best_palm_candidate(
-            frame_bgr, image_w, image_h, palm_thr, prefer_pointing, faces
+            frame_bgr, image_w, image_h, palm_thr, prefer_pinch, faces
         )
         if best is not None:
             out, rect = best
-            points = self._smooth(out[0], now_s)
+            shaped = self._shape_apply(out[0], image_w, image_h)
+            points = self._smooth(shaped, now_s)
             self._prev_points_norm = points
             self._prev_rect = rect
             self._miss = 0
-            pointing_now = is_pointing(points)
-            self._track_tip(pointing_now, out[0], now_s, image_w, image_h)
-            if self._static_check(points, rect, now_s, image_w, image_h, pointing_now):
+            pinch_now = is_pinch(points)
+            self._track_tip(pinch_now, points, now_s, image_w, image_h)
+            if self._static_check(points, rect, now_s, image_w, image_h, pinch_now):
                 return []
             return [(points, out[1], out[2])]
 
@@ -679,14 +734,15 @@ class OnnxHands:
             if rect is not None:
                 out = self._landmark_tracked(frame_bgr, rect)
                 if out is not None and self._on_crop(out[0], rect, image_w, image_h):
-                    points = self._smooth(out[0], now_s)
+                    shaped = self._shape_apply(out[0], image_w, image_h)
+                    points = self._smooth(shaped, now_s)
                     self._prev_points_norm = points
                     self._prev_rect = rect
                     self._miss = 0
-                    pointing_now = is_pointing(points)
-                    self._track_tip(pointing_now, out[0], now_s, image_w, image_h)
+                    pinch_now = is_pinch(points)
+                    self._track_tip(pinch_now, points, now_s, image_w, image_h)
                     if self._static_check(
-                        points, rect, now_s, image_w, image_h, pointing_now
+                        points, rect, now_s, image_w, image_h, pinch_now
                     ):
                         return []
                     return [(points, out[1], out[2])]
@@ -733,7 +789,7 @@ class OnnxHands:
         image_w: int,
         image_h: int,
         palm_thr: float,
-        prefer_pointing: bool,
+        prefer_pinch: bool,
         faces: list[tuple[float, float, float, float]] | None = None,
     ) -> tuple[tuple[list[tuple[float, float]], str, float], list[float]] | None:
         """Palm rects -> landmark inferences -> best gated candidate."""
@@ -749,7 +805,7 @@ class OnnxHands:
             # tracking, no quarantine cycle on a face.
             if faces and self._on_face(rect, faces):
                 continue
-            # Suppression lock (still-pointing sticker): a candidate
+            # Suppression lock (still-pinch sticker): a candidate
             # sitting on the locked spot is checked after the landmark
             # pass — only its fingertip can prove it is a different hand.
             suspect = False
@@ -764,7 +820,7 @@ class OnnxHands:
             out = self._landmark_smart(frame_bgr, rect)
             if out is None or not self._spread_ok(out[0], rect, image_w, image_h):
                 continue
-            pointing = is_pointing(out[0])
+            pinch = is_pinch(out[0])
             if suspect and self._lock is not None:
                 if rect[2] > 0.18 * image_w:
                     self._lock = None  # a real close hand took the spot
@@ -773,13 +829,13 @@ class OnnxHands:
                     tip_d = hypot(
                         tip[0] * image_w - self._lock[3], tip[1] * image_h - self._lock[4]
                     )
-                    if pointing and tip_d > LOCK_TIP_DIFF * min_dim:
+                    if pinch and tip_d > LOCK_TIP_DIFF * min_dim:
                         self._lock = None  # a different hand took the spot
                     else:
                         continue  # the sticker itself: rejected
-            # Persistent quarantine zones: a non-pointing candidate inside
-            # a remembered junk zone is dropped (a big close hand bypasses);
-            # a POINTING candidate in a zone clears it.
+            # Persistent quarantine zones: a non-pinch candidate inside a
+            # remembered junk zone is dropped (a big close hand bypasses);
+            # a PINCH candidate in a zone clears it.
             zone = next(
                 (
                     z
@@ -790,12 +846,12 @@ class OnnxHands:
                 None,
             )
             if zone is not None and not rect[2] > 0.18 * image_w:
-                if pointing:
+                if pinch:
                     self._zones.remove(zone)
                 else:
                     continue
-            if prefer_pointing and prev is not None and not pointing:
-                # Engaged cursor: a far non-pointing candidate must not
+            if prefer_pinch and prev is not None and not pinch:
+                # Engaged cursor: a far non-pinch candidate must not
                 # steal the hand (face anchor at frame center).
                 d = hypot(rect[0] - prev[0], rect[1] - prev[1])
                 if d > RECOVERY_NEAR_FACTOR * prev[2]:
