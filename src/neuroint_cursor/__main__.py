@@ -27,6 +27,7 @@ logger = logging.getLogger("neuroint_cursor")
 MODELS = Path(__file__).resolve().parents[2] / "models"
 PALM_MODEL = MODELS / "palm_detection_full_inf_post_192x192.onnx"
 LANDMARK_MODEL = MODELS / "hand_landmark_sparse_Nx3x224x224.onnx"
+FACE_MODEL = MODELS / "face_detection_yunet_2023mar.onnx"
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,13 +53,13 @@ def main() -> int:
         class_score_threshold=cfg.landmark_score_threshold,
         tracking=cfg.tracking,
         clahe=cfg.clahe,
+        face_model=FACE_MODEL,
     )
     act = CursorActuator(cfg.sensitivity, cfg.min_cutoff, cfg.beta)
     logger.info(
-        "screen %dx%d  active region %.2f of frame  provider %s",
+        "screen %dx%d  full-frame mapping  provider %s",
         act.screen_w,
         act.screen_h,
-        act.mapper.region_fraction,
         "DML" if "DmlExecutionProvider" in hands._landmark.get_providers() else "CPU",  # noqa: SLF001
     )
 
@@ -145,7 +146,6 @@ def main() -> int:
                     canvas = draw(
                         frame,
                         result,
-                        act.mapper.region(),
                         fps,
                         act.sensitivity,
                         active,

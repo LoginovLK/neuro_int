@@ -1,16 +1,16 @@
-"""Detection -> cursor coordinates: absolute pointing over an active region.
+"""Detection -> cursor coordinates: the whole frame maps to the whole screen.
 
-The fingertip inside a central active region of the camera frame maps to
-the whole screen (like a touchpad, but absolute). Higher sensitivity =
-larger active region = the same hand travel sweeps more screen.
+No active region: the fingertip anywhere in the camera frame points
+anywhere on the screen. Sensitivity is the GAIN around the frame center
+(sens 1.0: full frame -> full screen; sens 2.0: half the hand travel
+sweeps the whole screen; edges stay reachable at any sensitivity).
 Pure math, no I/O — unit-testable.
 """
 
 from __future__ import annotations
 
-MIN_REGION = 0.15
-MAX_REGION = 1.0
-REGION_PER_SENS = 0.5  # sensitivity 1.0 -> middle half of the frame
+MIN_SENS = 0.4
+MAX_SENS = 4.0
 
 
 class CursorMapper:
@@ -19,19 +19,11 @@ class CursorMapper:
         self.screen_h = screen_h
         self.sensitivity = sensitivity
 
-    @property
-    def region_fraction(self) -> float:
-        return min(MAX_REGION, max(MIN_REGION, REGION_PER_SENS * self.sensitivity))
-
-    def region(self) -> tuple[float, float, float, float]:
-        """Active region as normalized (x0, y0, x1, y1), centered."""
-        f = self.region_fraction
-        off = (1.0 - f) / 2.0
-        return (off, off, off + f, off + f)
-
     def map(self, fx: float, fy: float) -> tuple[int, int]:
-        """Normalized fingertip -> screen pixels, clamped to the region."""
-        x0, y0, x1, y1 = self.region()
-        nx = min(max((fx - x0) / (x1 - x0), 0.0), 1.0)
-        ny = min(max((fy - y0) / (y1 - y0), 0.0), 1.0)
-        return int(nx * self.screen_w), int(ny * self.screen_h)
+        """Normalized fingertip -> screen pixels. Center-anchored gain."""
+        g = min(MAX_SENS, max(MIN_SENS, self.sensitivity))
+        nx = min(max(0.5 + (fx - 0.5) * g, 0.0), 1.0)
+        ny = min(max(0.5 + (fy - 0.5) * g, 0.0), 1.0)
+        return min(int(nx * self.screen_w), self.screen_w - 1), min(
+            int(ny * self.screen_h), self.screen_h - 1
+        )

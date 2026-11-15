@@ -211,6 +211,7 @@ class OnnxHands:
         class_score_threshold: float = 0.25,
         tracking: bool = True,
         clahe: bool = True,
+        face_model: str | Path | None = None,
     ) -> None:
         options = ort.SessionOptions()
         options.log_severity_level = 3
@@ -232,6 +233,21 @@ class OnnxHands:
         self._class_score_threshold = class_score_threshold
         self._tracking = tracking
         self._clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) if clahe else None
+
+        # Face gate (YuNet, OpenCV Zoo): the palm model fires on faces at
+        # any threshold that still finds hands — measured live: quarantine
+        # events at (0.50, 0.60) = Lev's face, repeated every ~2s, resetting
+        # the bones each time. A real face detector kills the candidate
+        # BEFORE the landmark call (also saves its retry-storm cost).
+        self._face_det = None
+        if face_model is not None and Path(face_model).exists():
+            try:
+                self._face_det = cv2.FaceDetectorYN.create(
+                    str(face_model), "", (640, 360), score_threshold=0.6
+                )
+                logger.info("face gate: YuNet loaded")
+            except Exception as exc:  # noqa: BLE001 - gate is optional
+                logger.warning("face gate unavailable: %s", exc)
 
         self._filters: list[PointFilter2D] | None = None
         self._prev_points_norm: list[tuple[float, float]] | None = None
@@ -641,8 +657,9 @@ class OnnxHands:
         # at working distance scores >=0.5 — the 0.3 knob was anchoring
         # the face, not finding far hands.
         palm_thr = self._score_threshold
+        faces = self._face_boxes(frame_bgr)
         best = self._best_palm_candidate(
-            frame_bgr, image_w, image_h, palm_thr, prefer_pointing
+            frame_bgr, image_w, image_h, palm_thr, prefer_pointing, faces
         )
         if best is not None:
             out, rect = best
@@ -680,6 +697,36 @@ class OnnxHands:
             self._drop_track()
         return []
 
+    def _face_boxes(self, frame_bgr: np.ndarray) -> list[tuple[float, float, float, float]]:
+        """YuNet face boxes scaled to full-res (x, y, w, h); runs on 640x360."""
+        if self._face_det is None:
+            return []
+        image_h, image_w = frame_bgr.shape[:2]
+        small = cv2.resize(frame_bgr, (640, 360))
+        self._face_det.setInputSize((640, 360))
+        _, faces = self._face_det.detect(small)
+        if faces is None:
+            return []
+        sx, sy = image_w / 640.0, image_h / 360.0
+        return [(f[0] * sx, f[1] * sy, f[2] * sx, f[3] * sy) for f in faces]
+
+    @staticmethod
+    def _on_face(
+        rect: list[float], faces: list[tuple[float, float, float, float]]
+    ) -> bool:
+        """Palm candidate sitting ON a face: center inside the face box
+        (10% margin) and face-sized. A real hand raised at the forehead
+        keeps its center OUTSIDE the face box (verified on Lev's gun-pose
+        frame)."""
+        for fx, fy, fw, fh in faces:
+            if (
+                fx - 0.1 * fw <= rect[0] <= fx + 1.1 * fw
+                and fy - 0.1 * fh <= rect[1] <= fy + 1.1 * fh
+                and rect[2] <= 1.3 * fw
+            ):
+                return True
+        return False
+
     def _best_palm_candidate(
         self,
         frame_bgr: np.ndarray,
@@ -687,6 +734,7 @@ class OnnxHands:
         image_h: int,
         palm_thr: float,
         prefer_pointing: bool,
+        faces: list[tuple[float, float, float, float]] | None = None,
     ) -> tuple[tuple[list[tuple[float, float]], str, float], list[float]] | None:
         """Palm rects -> landmark inferences -> best gated candidate."""
         now_s = time.monotonic()
@@ -697,6 +745,10 @@ class OnnxHands:
         best: tuple[tuple[list[tuple[float, float]], str, float], list[float]] | None = None
         best_eff = -1.0
         for rect in rectsn:
+            # Face gate before anything expensive: no landmark call, no
+            # tracking, no quarantine cycle on a face.
+            if faces and self._on_face(rect, faces):
+                continue
             # Suppression lock (still-pointing sticker): a candidate
             # sitting on the locked spot is checked after the landmark
             # pass — only its fingertip can prove it is a different hand.

@@ -1,4 +1,4 @@
-"""Debug window drawing: skeleton, fingertip, active region, status."""
+"""Debug window drawing: skeleton, fingertip, status."""
 
 from __future__ import annotations
 
@@ -16,14 +16,11 @@ WHITE = (255, 255, 255)
 def draw(
     frame: np.ndarray,
     result: tuple[list[tuple[float, float]], str, float] | None,
-    region: tuple[float, float, float, float],
     fps: float,
     sens: float,
     active: bool,
 ) -> np.ndarray:
     h, w = frame.shape[:2]
-    x0, y0, x1, y1 = region
-    cv2.rectangle(frame, (int(x0 * w), int(y0 * h)), (int(x1 * w), int(y1 * h)), GRAY, 1)
 
     handed = "-"
     if result is not None:
