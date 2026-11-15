@@ -181,18 +181,16 @@ def classify(pts: list[tuple[float, float]]) -> str:
 def is_zero(
     pts: list[tuple[float, float]],
     max_hull: float = 1.0,
-    max_tip_to_palm: float = 0.75,
-    min_curled: int = 3,
+    max_tip_to_palm: float = 0.5,
+    min_curled: int = 4,
 ) -> bool:
-    """The 'zero' pose: fingers rolled into tubes toward the palm.
+    """The 'zero' pose: fingers rolled into tubes toward the palm center.
 
-    Physically opposite of the bundle: the tips FOLD BACK toward the
-    palm center (a bundle throws them forward past the palm outline).
-    Gates, palm-length units: at least 3 fingers curled (tip closer to
-    the wrist than its PIP), the tip cluster sits within 0.75 palm
-    lengths of the palm center, and the hand stays compact. Zero and
-    bundle are mutually exclusive by construction (bundle needs reach
-    >= 0.9, zero caps it at <= 0.75).
+    Strict on purpose: a circular hand motion tilts the palm and bends
+    the fingers part-way, which must NOT read as zero (false center
+    commands). Gates, palm-length units: ALL 4 fingers curled (tip
+    closer to the wrist than its PIP), the tip cluster sits within 0.5
+    palm lengths of the palm center, hand compact.
     """
     hand = _dist(pts[WRIST], pts[MIDDLE_MCP])
     if hand < 1e-6:

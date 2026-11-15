@@ -41,7 +41,7 @@ TIPS = (8, 12, 16, 20)
 # static texture-latch (hair/chair stick): the VIDEO tracker latches onto
 # textures and redraws a hand forever; IMAGE-mode on the same frame finds
 # nothing. A non-pinch hand frozen in place for this long is locked out.
-STATIC_LATCH_SECONDS = 2.5
+STATIC_LATCH_SECONDS = 4.0
 # coast: when tracking drops (fast swipe, blur) keep the last skeleton and
 # carry it along the last bundle velocity instead of blinking off and
 # re-drawing at the new spot
@@ -315,25 +315,15 @@ class MediaPipeHands:
                 len(faces),
             )
         if not candidates:
-            # coast: no blink-off — carry the last skeleton along the last
-            # bundle velocity for a short grace period
+            # coast: no blink-off — the last skeleton stays FROZEN in
+            # place (velocity flight dragged the cursor and read as the
+            # sens going crazy)
             if (
                 self._coast is not None
                 and self._lock is None
                 and now_s - self._coast_t <= COAST_SECONDS
             ):
-                dt = max(now_s - self._coast_t, 1 / 120)
-                dx = max(
-                    min(self._bundle_vel[0] * dt, COAST_VEL_CAP * dt),
-                    -COAST_VEL_CAP * dt,
-                )
-                dy = max(
-                    min(self._bundle_vel[1] * dt, COAST_VEL_CAP * dt),
-                    -COAST_VEL_CAP * dt,
-                )
                 pts, handed, score = self._coast
-                pts = [(p[0] + dx / image_w, p[1] + dy / image_h) for p in pts]
-                self._coast = (pts, handed, score)
                 self._coast_t = now_s
                 return [(pts, handed, score)]
             self._shape = None
