@@ -135,17 +135,20 @@ def palm_center(pts: list[tuple[float, float]]) -> tuple[float, float]:
 
 
 def extended_finger_count(pts: list[tuple[float, float]]) -> int:
-    """How many fingers point forward: the tip is FARTHER from the wrist
-    than its PIP by a real margin (a half-curl stays below the margin).
-
-    0 = closed bundle/control, 1 = left click, 2 = right click,
-    3 = middle/scroll, 4 = open palm.
+    """How many fingers point forward, STRICTLY: the tip is farther from
+    the wrist than its PIP by a real margin AND the finger is straight
+    (PIP bend < 45 deg). A loose count flickers 1..3 on an open palm and
+    spams clicks; the strict count keeps an open palm at 4 (open) and a
+    closed hand at 0 (control).
     """
-    return sum(
-        1
-        for tip, pip, _mcp in FINGERS.values()
-        if _dist(pts[WRIST], pts[tip]) > _dist(pts[WRIST], pts[pip]) * 1.18
-    )
+    n = 0
+    for name, (tip, pip, mcp) in FINGERS.items():
+        if _dist(pts[WRIST], pts[tip]) <= _dist(pts[WRIST], pts[pip]) * 1.25:
+            continue
+        if _bend_deg(pts[tip], pts[pip], pts[mcp]) > 45.0:
+            continue
+        n += 1
+    return n
 
 
 def classify(pts: list[tuple[float, float]]) -> str:

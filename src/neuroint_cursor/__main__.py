@@ -124,7 +124,8 @@ def main() -> int:
     on_counter = off_counter = 0
     zero_fired = False
     cls_win: deque[str] = deque(maxlen=8)
-    last_cmd: str | None = None
+    prev_stable: str | None = None
+    last_click_t = 0.0
     fps_t = time.monotonic()
     fps_frames = 0
     fps = 0.0
@@ -193,21 +194,31 @@ def main() -> int:
                 if not zero:
                     zero_fired = False
 
-                # finger-count commands (edge-triggered on the stable class)
+                # finger-count commands: STRICT edge-trigger — a click fires
+                # only on the transition CONTROL -> point-N (show fingers
+                # from the closed hand). An open palm never clicks, and a
+                # 0.5s cooldown blocks accidental double-fires.
                 if stable != "point3":
                     act.stop_scroll()
-                if stable == "point1" and last_cmd != "point1":
+                from_ctrl = prev_stable == "control" or prev_stable == "none"
+                now_s_c = time.monotonic()
+                if now_s_c - last_click_t < 0.5:
+                    from_ctrl = False
+                if stable == "point1" and from_ctrl:
                     act.click(Button.left)
+                    last_click_t = now_s_c
                     logger.info("gesture: left click")
-                elif stable == "point2" and last_cmd != "point2":
+                elif stable == "point2" and from_ctrl:
                     act.click(Button.right)
+                    last_click_t = now_s_c
                     logger.info("gesture: right click")
-                elif stable == "point3" and last_cmd != "point3":
+                elif stable == "point3" and from_ctrl:
                     act.start_scroll(pinch_center(result[0])[1])
+                    last_click_t = now_s_c
                     logger.info("gesture: wheel grab")
                 elif stable == "point3":
                     act.scroll_by(pinch_center(result[0])[1])
-                last_cmd = stable
+                prev_stable = stable
 
                 if active and result is not None:
                     fx, fy = pinch_center(result[0])  # the bundle center
