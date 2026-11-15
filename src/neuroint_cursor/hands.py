@@ -93,6 +93,24 @@ STATIC_IOU = 0.4          # median box overlap that also counts as "same object"
 QUARANTINE_RADIUS = 0.08  # zone rejection radius, fraction of min(frame_w, frame_h)
 ZONE_LIMIT = 6            # FIFO cap on remembered zones
 
+# Still-POINTING sticker: a hallucination that reads pointing forever is
+# exempt from the never-pointing quarantine — and it can even ENGAGE the
+# cursor (measured live: "POINTING - cursor follows finger" on a bed
+# corner). The discriminator a single frame cannot fake: a hand IN USE
+# moves the cursor, so its fingertip wanders; a sticker is frozen. After
+# STILL_POINTING_SECONDS of continuous pointing with a frozen fingertip
+# (or a frozen box) the spot is locked out: control drops, candidates
+# there are rejected. The lock opens when the box moves away / vanishes
+# for LOCK_UNLOCK_SECONDS, a big close hand arrives, or a pointing
+# candidate with a DIFFERENT fingertip appears (a real hand coming to
+# that corner; the sticker's tip is frozen within the spread bound, so
+# it can never satisfy the tip-difference test itself).
+STILL_POINTING_SECONDS = 5.0
+STILL_TIP_SPREAD = 0.02   # frozen-tip radius, fraction of min(frame_w, frame_h)
+LOCK_TIP_DIFF = 0.06      # tip distance that proves "a different hand"
+LOCK_IOU = 0.3            # box overlap that counts as "still at the spot"
+LOCK_UNLOCK_SECONDS = 1.0 # spot unattended this long -> lock opens
+
 # A candidate far from the last hand position (this factor of the last
 # rect size) may not steal the track while the cursor is engaged and it
 # is not pointing.
@@ -221,7 +239,10 @@ class OnnxHands:
         self._miss = 0
         self._rot_fix = 0.0
         self._hist: deque[tuple[float, float, float, float]] = deque()
+        self._tip_hist: deque[tuple[float, float, float]] = deque()
         self._zones: list[tuple[float, float]] = []
+        self._lock: tuple[float, float, float, float, float] | None = None
+        self._lock_seen = 0.0
 
     def _drop_track(self) -> None:
         self._prev_points_norm = None
@@ -229,6 +250,7 @@ class OnnxHands:
         self._miss = 0
         self._rot_fix = 0.0
         self._hist.clear()
+        self._tip_hist.clear()
         self.reset_smoothing()
 
     def reset_smoothing(self) -> None:
@@ -477,6 +499,24 @@ class OnnxHands:
             )
         ]
 
+    def _track_tip(
+        self,
+        pointing_now: bool,
+        raw_points: list[tuple[float, float]],
+        now_s: float,
+        image_w: int,
+        image_h: int,
+    ) -> None:
+        """Raw fingertip history for the still-pointing sticker check."""
+        if not pointing_now:
+            self._tip_hist.clear()  # a broken pointing streak resets it
+            return
+        horizon = now_s - STILL_POINTING_SECONDS
+        while self._tip_hist and self._tip_hist[0][0] < horizon:
+            self._tip_hist.popleft()
+        tip = raw_points[8]
+        self._tip_hist.append((now_s, tip[0] * image_w, tip[1] * image_h))
+
     @staticmethod
     def _iou(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
         """Axis-aligned IoU of two (t, cx, cy, size) square boxes."""
@@ -492,6 +532,12 @@ class OnnxHands:
         union = a[3] * a[3] + b[3] * b[3] - inter
         return inter / union if union > 0 else 0.0
 
+    def _remember_zone(self, zx: float, zy: float) -> None:
+        zone = (zx, zy)
+        if zone not in self._zones:
+            self._zones.append(zone)
+            del self._zones[:-ZONE_LIMIT]
+
     def _static_check(
         self,
         points: list[tuple[float, float]],
@@ -499,36 +545,66 @@ class OnnxHands:
         now_s: float,
         image_w: int,
         image_h: int,
+        pointing_now: bool,
     ) -> bool:
-        """True when the object was just quarantined (still, never pointing)."""
+        """True when the object was just quarantined / locked out."""
         self._hist.append((now_s, rect[0], rect[1], float(rect[2])))
-        horizon = now_s - STATIC_SECONDS
+        horizon = now_s - STILL_POINTING_SECONDS
         while self._hist and self._hist[0][0] < horizon:
             self._hist.popleft()
-        if (
-            len(self._hist) < 15
-            or self._hist[-1][0] - self._hist[0][0] < STATIC_SECONDS * 0.8
-            or is_pointing(points)
-        ):
-            return False
-        cxs = [c for _, c, _, _ in self._hist]
-        cys = [c for _, _, c, _ in self._hist]
-        med_cx, med_cy = median(cxs), median(cys)
         min_dim = min(image_w, image_h)
-        med_dist = hypot(cxs[-1] - med_cx, cys[-1] - med_cy)
-        med_iou = median([self._iou(self._hist[-1], r) for r in self._hist])
-        # Still by center OR by overlap: textured junk hops its box
-        # between bright spots (centers spread, IoU stays high).
-        if med_dist > STATIC_RADIUS * min_dim and med_iou < STATIC_IOU:
-            return False
-        zone = (med_cx / image_w, med_cy / image_h)
-        if zone not in self._zones:
-            self._zones.append(zone)
-            del self._zones[:-ZONE_LIMIT]
-        self._hist.clear()
-        self._drop_track()
-        logger.info("static object at (%.2f, %.2f) quarantined", zone[0], zone[1])
-        return True
+
+        # tier 1: still and NEVER pointing for 2s -> persistent zone
+        if not pointing_now:
+            recent = [r for r in self._hist if r[0] >= now_s - STATIC_SECONDS]
+            if (
+                len(recent) >= 15
+                and recent[-1][0] - recent[0][0] >= STATIC_SECONDS * 0.8
+            ):
+                cxs = [c for _, c, _, _ in recent]
+                cys = [c for _, _, c, _ in recent]
+                med_cx, med_cy = median(cxs), median(cys)
+                med_dist = hypot(cxs[-1] - med_cx, cys[-1] - med_cy)
+                med_iou = median([self._iou(recent[-1], r) for r in recent])
+                # Still by center OR by overlap: textured junk hops its box
+                # between bright spots (centers spread, IoU stays high).
+                if med_dist <= STATIC_RADIUS * min_dim or med_iou >= STATIC_IOU:
+                    self._remember_zone(med_cx / image_w, med_cy / image_h)
+                    self._hist.clear()
+                    self._tip_hist.clear()
+                    self._drop_track()
+                    logger.info(
+                        "static object at (%.2f, %.2f) quarantined",
+                        med_cx / image_w,
+                        med_cy / image_h,
+                    )
+                    return True
+
+        # tier 2: still-POINTING sticker (5s frozen fingertip or frozen box)
+        if (
+            pointing_now
+            and len(self._tip_hist) >= 30
+            and self._tip_hist[-1][0] - self._tip_hist[0][0]
+            >= STILL_POINTING_SECONDS * 0.8
+        ):
+            txs = [x for _, x, _y in self._tip_hist]
+            tys = [y for _, _x, y in self._tip_hist]
+            tip_spread = hypot(max(txs) - min(txs), max(tys) - min(tys))
+            med_iou = median([self._iou(self._hist[-1], r) for r in self._hist])
+            if tip_spread <= STILL_TIP_SPREAD * min_dim or med_iou >= STATIC_IOU:
+                tip = self._tip_hist[-1]
+                self._lock = (rect[0], rect[1], float(rect[2]), tip[1], tip[2])
+                self._lock_seen = now_s
+                self._hist.clear()
+                self._tip_hist.clear()
+                self._drop_track()
+                logger.warning(
+                    "still-pointing sticker locked out at (%.2f, %.2f)",
+                    rect[0] / image_w,
+                    rect[1] / image_h,
+                )
+                return True
+        return False
 
     def detect(
         self, frame_bgr: np.ndarray, prefer_pointing: bool = False
@@ -574,7 +650,9 @@ class OnnxHands:
             self._prev_points_norm = points
             self._prev_rect = rect
             self._miss = 0
-            if self._static_check(points, rect, now_s, image_w, image_h):
+            pointing_now = is_pointing(points)
+            self._track_tip(pointing_now, out[0], now_s, image_w, image_h)
+            if self._static_check(points, rect, now_s, image_w, image_h, pointing_now):
                 return []
             return [(points, out[1], out[2])]
 
@@ -588,7 +666,11 @@ class OnnxHands:
                     self._prev_points_norm = points
                     self._prev_rect = rect
                     self._miss = 0
-                    if self._static_check(points, rect, now_s, image_w, image_h):
+                    pointing_now = is_pointing(points)
+                    self._track_tip(pointing_now, out[0], now_s, image_w, image_h)
+                    if self._static_check(
+                        points, rect, now_s, image_w, image_h, pointing_now
+                    ):
                         return []
                     return [(points, out[1], out[2])]
 
@@ -607,20 +689,45 @@ class OnnxHands:
         prefer_pointing: bool,
     ) -> tuple[tuple[list[tuple[float, float]], str, float], list[float]] | None:
         """Palm rects -> landmark inferences -> best gated candidate."""
+        now_s = time.monotonic()
         rectsn = self._cluster_filter(self._palm_rects(frame_bgr, palm_thr))
         min_dim = min(image_w, image_h)
         prev = self._prev_rect
+        lock = self._lock
         best: tuple[tuple[list[tuple[float, float]], str, float], list[float]] | None = None
         best_eff = -1.0
         for rect in rectsn:
+            # Suppression lock (still-pointing sticker): a candidate
+            # sitting on the locked spot is checked after the landmark
+            # pass — only its fingertip can prove it is a different hand.
+            suspect = False
+            if lock is not None:
+                lcx, lcy, lsize = lock[0], lock[1], lock[2]
+                overlaps = self._iou(
+                    (0.0, rect[0], rect[1], float(rect[2])), (0.0, lcx, lcy, lsize)
+                ) >= LOCK_IOU or hypot(rect[0] - lcx, rect[1] - lcy) <= STATIC_RADIUS * min_dim
+                if overlaps:
+                    self._lock_seen = now_s
+                    suspect = True
             out = self._landmark_smart(frame_bgr, rect)
             if out is None or not self._spread_ok(out[0], rect, image_w, image_h):
                 continue
             pointing = is_pointing(out[0])
+            if suspect and self._lock is not None:
+                if rect[2] > 0.18 * image_w:
+                    self._lock = None  # a real close hand took the spot
+                else:
+                    tip = out[0][8]
+                    tip_d = hypot(
+                        tip[0] * image_w - self._lock[3], tip[1] * image_h - self._lock[4]
+                    )
+                    if pointing and tip_d > LOCK_TIP_DIFF * min_dim:
+                        self._lock = None  # a different hand took the spot
+                    else:
+                        continue  # the sticker itself: rejected
             # Persistent quarantine zones: a non-pointing candidate inside
-            # a remembered junk zone is dropped (a big close hand — a real
-            # hand near the camera — bypasses); a POINTING candidate in a
-            # zone clears it (intentional use beats the quarantine).
+            # a remembered junk zone is dropped (a big close hand bypasses);
+            # a POINTING candidate in a zone clears it.
             zone = next(
                 (
                     z
@@ -645,4 +752,11 @@ class OnnxHands:
             if eff > best_eff:
                 best = (out, rect)
                 best_eff = eff
+        # The lock opens when nothing sits on the spot for a second.
+        if (
+            self._lock is not None
+            and self._lock_seen
+            and now_s - self._lock_seen > LOCK_UNLOCK_SECONDS
+        ):
+            self._lock = None
         return best
