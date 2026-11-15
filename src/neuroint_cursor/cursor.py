@@ -11,7 +11,7 @@ import sys
 from collections import deque
 from statistics import median
 
-from pynput.mouse import Controller
+from pynput.mouse import Button, Controller
 
 from neuroint_cursor.mapping import CursorMapper
 from neuroint_cursor.smoothing import PointFilter2D
@@ -69,6 +69,9 @@ class CursorActuator:
         self._median_win: deque[tuple[int, int]] = deque(maxlen=3)
         self._anchor_frame: tuple[float, float] | None = None
         self._anchor_cursor: tuple[int, int] | None = None
+        self._scroll_ref: float | None = None
+        self._scroll_acc = 0.0
+        self._scroll_active = False
 
     @property
     def sensitivity(self) -> float:
@@ -111,3 +114,41 @@ class CursorActuator:
         my = int(median(p[1] for p in self._median_win))
         self._mouse.position = (mx, my)
         return mx, my
+
+    # ---------------- mouse button gestures ----------------
+
+    def click(self, button: Button) -> None:
+        self._mouse.press(button)
+        self._mouse.release(button)
+
+    def middle_down(self) -> None:
+        self._mouse.press(Button.middle)
+
+    def middle_up(self) -> None:
+        self._mouse.release(Button.middle)
+
+    def start_scroll(self, bundle_fy: float) -> None:
+        """Middle-wheel grab: bind the scroll reference to the bundle."""
+        self.middle_down()
+        self._scroll_ref = bundle_fy
+        self._scroll_acc = 0.0
+        self._scroll_active = True
+
+    def scroll_by(self, bundle_fy: float) -> None:
+        """Vertical hand travel -> vertical wheel steps (40px per step)."""
+        if self._scroll_ref is None:
+            self._scroll_ref = bundle_fy
+            return
+        self._scroll_acc += bundle_fy - self._scroll_ref
+        self._scroll_ref = bundle_fy
+        steps = int(self._scroll_acc * self.screen_h / 40.0)
+        if steps != 0:
+            self._scroll_acc -= steps * 40.0 / self.screen_h
+            self._mouse.scroll(0, -steps)
+
+    def stop_scroll(self) -> None:
+        if self._scroll_active:
+            self.middle_up()
+            self._scroll_ref = None
+            self._scroll_acc = 0.0
+            self._scroll_active = False

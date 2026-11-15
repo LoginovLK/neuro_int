@@ -134,6 +134,47 @@ def palm_center(pts: list[tuple[float, float]]) -> tuple[float, float]:
     return px, py
 
 
+def extended_finger_count(pts: list[tuple[float, float]]) -> int:
+    """How many fingers point forward: the tip is FARTHER from the wrist
+    than its PIP by a real margin (a half-curl stays below the margin).
+
+    0 = closed bundle/control, 1 = left click, 2 = right click,
+    3 = middle/scroll, 4 = open palm.
+    """
+    return sum(
+        1
+        for tip, pip, _mcp in FINGERS.values()
+        if _dist(pts[WRIST], pts[tip]) > _dist(pts[WRIST], pts[pip]) * 1.18
+    )
+
+
+def classify(pts: list[tuple[float, float]]) -> str:
+    """Gesture class for the state machine.
+
+    'zero'   — fingers rolled into tubes to the palm center: center cursor
+    'point1' — index only: left click
+    'point2' — index+middle: right click
+    'point3' — three fingers: middle press (hold + move = scroll)
+    'open'   — open palm: release everything
+    'control'— anything closed in between: the cursor-driving pose
+    """
+    hand = _dist(pts[WRIST], pts[MIDDLE_MCP])
+    if hand < 1e-6:
+        return "control"
+    if is_zero(pts):
+        return "zero"
+    n = extended_finger_count(pts)
+    if n >= 4:
+        return "open"
+    if n == 1:
+        return "point1"
+    if n == 2:
+        return "point2"
+    if n == 3:
+        return "point3"
+    return "control"
+
+
 def is_zero(
     pts: list[tuple[float, float]],
     max_hull: float = 1.0,

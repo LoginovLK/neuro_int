@@ -15,16 +15,18 @@ import logging.handlers
 import queue as queue_mod
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 import cv2
+from pynput.mouse import Button
 
 from neuroint_cursor.camera import Camera
 from neuroint_cursor.config import Settings
 from neuroint_cursor.cursor import CursorActuator
 from neuroint_cursor.hands import OnnxHands
 from neuroint_cursor.overlay import draw
-from neuroint_cursor.pose import is_pinch, is_zero, pinch_center
+from neuroint_cursor.pose import classify, pinch_center
 
 logger = logging.getLogger("neuroint_cursor")
 
@@ -120,8 +122,9 @@ def main() -> int:
     frames = detected = pointing_frames = moved = 0
     active = False
     on_counter = off_counter = 0
-    zero_counter = 0
     zero_fired = False
+    cls_win: deque[str] = deque(maxlen=8)
+    last_cmd: str | None = None
     fps_t = time.monotonic()
     fps_frames = 0
     fps = 0.0
@@ -154,14 +157,18 @@ def main() -> int:
                 # off-debounce right after.
                 fresh = (now - getattr(hands, "_last_fresh", now)) <= 0.15
 
-                pointing = fresh and result is not None and is_pinch(result[0])
-                # the zero gesture is a one-shot command, never control
-                zero = fresh and result is not None and is_zero(result[0])
-                if zero:
-                    pointing = False
-                zero_counter = zero_counter + 1 if zero else 0
-                if not zero:
-                    zero_fired = False
+                # gesture classification (fresh results only)
+                state = "none"
+                if fresh and result is not None:
+                    state = classify(result[0])
+                cls_win.append(state)
+                stable = state if (
+                    len(cls_win) >= 3
+                    and cls_win[-1] == cls_win[-2] == cls_win[-3]
+                ) else None
+
+                pointing = stable == "control"
+                zero = stable == "zero"
 
                 # Debounce both edges: ON after a few bundle frames,
                 # OFF only after a grace period (single dropped detections
@@ -177,12 +184,30 @@ def main() -> int:
 
                 # zero gesture: park the cursor in the screen center once
                 # per gesture (edge-triggered)
-                if zero_counter == cfg.debounce_frames and not zero_fired:
+                if zero and not zero_fired:
                     act.center()
                     zero_fired = True
                     active = False
                     on_counter = 0
                     logger.info("zero gesture: cursor centered")
+                if not zero:
+                    zero_fired = False
+
+                # finger-count commands (edge-triggered on the stable class)
+                if stable != "point3":
+                    act.stop_scroll()
+                if stable == "point1" and last_cmd != "point1":
+                    act.click(Button.left)
+                    logger.info("gesture: left click")
+                elif stable == "point2" and last_cmd != "point2":
+                    act.click(Button.right)
+                    logger.info("gesture: right click")
+                elif stable == "point3" and last_cmd != "point3":
+                    act.start_scroll(pinch_center(result[0])[1])
+                    logger.info("gesture: wheel grab")
+                elif stable == "point3":
+                    act.scroll_by(pinch_center(result[0])[1])
+                last_cmd = stable
 
                 if active and result is not None:
                     fx, fy = pinch_center(result[0])  # the bundle center

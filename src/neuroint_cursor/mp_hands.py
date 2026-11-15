@@ -23,7 +23,7 @@ from statistics import median
 import cv2
 import numpy as np
 
-from neuroint_cursor.pose import is_pinch, is_zero, pinch_center
+from neuroint_cursor.pose import classify, is_pinch, pinch_center
 from neuroint_cursor.smoothing import PointFilter2D
 
 logger = logging.getLogger(__name__)
@@ -358,7 +358,7 @@ class MediaPipeHands:
             max(p[0] for p in pts_px),
             max(p[1] for p in pts_px),
         )
-        if is_pinch(pts21):
+        if is_pinch(pts21) or prefer_pinch:
             self._shist.clear()
         else:
             self._shist.append((now_s, *bb))
@@ -384,9 +384,7 @@ class MediaPipeHands:
         # changed - re-freeze from the live cloud this same frame. The
         # tip-divergence threshold alone missed partial switches (that
         # is why gestures used to switch only through an open palm).
-        if self._shape is not None and (
-            is_pinch(pts21) != is_pinch(shaped) or is_zero(pts21) != is_zero(shaped)
-        ):
+        if self._shape is not None and classify(pts21) != classify(shaped):
             shaped = self._shape_apply(
                 pts21, now_s, image_w, image_h, force_refit=True
             )
