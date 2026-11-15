@@ -124,6 +124,19 @@ def test_peace_is_not_pointing():
     assert not is_pointing(pts)
 
 
+def test_index_must_be_the_extremum():
+    """☝ physical invariant: the index TIP is the farthest fingertip from
+    the wrist. Junk hallucinations passing the state checks put some
+    other fingertip farther out — they must not read as pointing."""
+    pts = _hand(
+        _straight_finger(0.47, 0.70),
+        _curled_finger(0.52, 0.68),
+        _curled_finger(0.56, 0.70),
+        _straight_finger(0.60, 0.72, up=0.45),  # pinky stretched way out
+    )
+    assert not is_pointing(pts)
+
+
 def test_pointing_is_rotation_invariant():
     pts = _pointing_hand()
     for deg in (40, -70, 180):

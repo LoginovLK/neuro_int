@@ -43,6 +43,7 @@ import time
 from collections import deque
 from math import atan2, cos, hypot, pi, sin
 from pathlib import Path
+from statistics import median
 
 import cv2
 import numpy as np
@@ -76,13 +77,21 @@ POINTING_BONUS = 0.15
 # Static-object rejection: shelf junk / furniture edges get detected as a
 # palm and then tracked forever. A real hand always micro-sways, and a
 # hand HELD deliberately still is in pointing pose (in use). So: an
-# object whose ROI center has not moved for STATIC_SECONDS while never
-# pointing is not a hand — drop it and quarantine that spot for
-# QUARANTINE_SECONDS (palm candidates there are ignored).
+# object that stays put for STATIC_SECONDS while never pointing is not
+# a hand — drop it and remember a quarantine ZONE at that spot.
+# "Stays put" = the rect center hovers near the window median OR the
+# boxes keep overlapping (IoU): on textured junk the palm box hops
+# between bright spots, centers spread wider than any radius, but the
+# boxes still cover the same object — measured live (the skeleton that
+# would not go away). Zones are PERSISTENT: the old 8s expiry made the
+# junk re-appear in a 2s-visible/8s-hidden cycle; a zone is cleared only
+# by a POINTING candidate at that spot (intentional use) or bypassed by
+# a big close hand.
 STATIC_SECONDS = 2.0
-STATIC_SPREAD = 0.10      # fraction of min(frame_w, frame_h)
-QUARANTINE_SECONDS = 8.0
-QUARANTINE_RADIUS = 0.08  # fraction of min(frame_w, frame_h)
+STATIC_RADIUS = 0.16      # median-center radius, fraction of min(frame_w, frame_h)
+STATIC_IOU = 0.4          # median box overlap that also counts as "same object"
+QUARANTINE_RADIUS = 0.08  # zone rejection radius, fraction of min(frame_w, frame_h)
+ZONE_LIMIT = 6            # FIFO cap on remembered zones
 
 # A candidate far from the last hand position (this factor of the last
 # rect size) may not steal the track while the cursor is engaged and it
@@ -211,9 +220,8 @@ class OnnxHands:
         self._prev_rect: list[float] | None = None
         self._miss = 0
         self._rot_fix = 0.0
-        self._hist: deque[tuple[float, float, float]] = deque()
-        self._excl_until = 0.0
-        self._excl_at: tuple[float, float] = (0.0, 0.0)
+        self._hist: deque[tuple[float, float, float, float]] = deque()
+        self._zones: list[tuple[float, float]] = []
 
     def _drop_track(self) -> None:
         self._prev_points_norm = None
@@ -469,40 +477,58 @@ class OnnxHands:
             )
         ]
 
+    @staticmethod
+    def _iou(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
+        """Axis-aligned IoU of two (t, cx, cy, size) square boxes."""
+        ax0, ax1 = a[1] - a[3] / 2, a[1] + a[3] / 2
+        ay0, ay1 = a[2] - a[3] / 2, a[2] + a[3] / 2
+        bx0, bx1 = b[1] - b[3] / 2, b[1] + b[3] / 2
+        by0, by1 = b[2] - b[3] / 2, b[2] + b[3] / 2
+        iw = min(ax1, bx1) - max(ax0, bx0)
+        ih = min(ay1, by1) - max(ay0, by0)
+        if iw <= 0 or ih <= 0:
+            return 0.0
+        inter = iw * ih
+        union = a[3] * a[3] + b[3] * b[3] - inter
+        return inter / union if union > 0 else 0.0
+
     def _static_check(
         self,
         points: list[tuple[float, float]],
-        center: tuple[float, float],
+        rect: list[float],
         now_s: float,
         image_w: int,
         image_h: int,
     ) -> bool:
         """True when the object was just quarantined (still, never pointing)."""
-        self._hist.append((now_s, center[0], center[1]))
+        self._hist.append((now_s, rect[0], rect[1], float(rect[2])))
         horizon = now_s - STATIC_SECONDS
         while self._hist and self._hist[0][0] < horizon:
             self._hist.popleft()
         if (
-            len(self._hist) >= 15
-            and self._hist[-1][0] - self._hist[0][0] >= STATIC_SECONDS * 0.8
-            and not is_pointing(points)
+            len(self._hist) < 15
+            or self._hist[-1][0] - self._hist[0][0] < STATIC_SECONDS * 0.8
+            or is_pointing(points)
         ):
-            cxs = [c for _, c, _ in self._hist]
-            cys = [c for _, _, c in self._hist]
-            spread = hypot(max(cxs) - min(cxs), max(cys) - min(cys))
-            if spread <= STATIC_SPREAD * min(image_w, image_h):
-                self._excl_at = (cxs[-1] / image_w, cys[-1] / image_h)
-                self._excl_until = now_s + QUARANTINE_SECONDS
-                self._hist.clear()
-                self._drop_track()
-                logger.info(
-                    "static object at (%.2f, %.2f) quarantined %.0fs",
-                    self._excl_at[0],
-                    self._excl_at[1],
-                    QUARANTINE_SECONDS,
-                )
-                return True
-        return False
+            return False
+        cxs = [c for _, c, _, _ in self._hist]
+        cys = [c for _, _, c, _ in self._hist]
+        med_cx, med_cy = median(cxs), median(cys)
+        min_dim = min(image_w, image_h)
+        med_dist = hypot(cxs[-1] - med_cx, cys[-1] - med_cy)
+        med_iou = median([self._iou(self._hist[-1], r) for r in self._hist])
+        # Still by center OR by overlap: textured junk hops its box
+        # between bright spots (centers spread, IoU stays high).
+        if med_dist > STATIC_RADIUS * min_dim and med_iou < STATIC_IOU:
+            return False
+        zone = (med_cx / image_w, med_cy / image_h)
+        if zone not in self._zones:
+            self._zones.append(zone)
+            del self._zones[:-ZONE_LIMIT]
+        self._hist.clear()
+        self._drop_track()
+        logger.info("static object at (%.2f, %.2f) quarantined", zone[0], zone[1])
+        return True
 
     def detect(
         self, frame_bgr: np.ndarray, prefer_pointing: bool = False
@@ -548,7 +574,7 @@ class OnnxHands:
             self._prev_points_norm = points
             self._prev_rect = rect
             self._miss = 0
-            if self._static_check(points, (rect[0], rect[1]), now_s, image_w, image_h):
+            if self._static_check(points, rect, now_s, image_w, image_h):
                 return []
             return [(points, out[1], out[2])]
 
@@ -562,9 +588,7 @@ class OnnxHands:
                     self._prev_points_norm = points
                     self._prev_rect = rect
                     self._miss = 0
-                    if self._static_check(
-                        points, (rect[0], rect[1]), now_s, image_w, image_h
-                    ):
+                    if self._static_check(points, rect, now_s, image_w, image_h):
                         return []
                     return [(points, out[1], out[2])]
 
@@ -583,24 +607,34 @@ class OnnxHands:
         prefer_pointing: bool,
     ) -> tuple[tuple[list[tuple[float, float]], str, float], list[float]] | None:
         """Palm rects -> landmark inferences -> best gated candidate."""
-        now_s = time.monotonic()
         rectsn = self._cluster_filter(self._palm_rects(frame_bgr, palm_thr))
-        quarantining = now_s < self._excl_until
-        qx, qy = self._excl_at
-        qrad = QUARANTINE_RADIUS * min(image_w, image_h)
+        min_dim = min(image_w, image_h)
         prev = self._prev_rect
         best: tuple[tuple[list[tuple[float, float]], str, float], list[float]] | None = None
         best_eff = -1.0
         for rect in rectsn:
-            # A big palm box is a close real hand — never quarantine-block it
-            # (junk blobs are small; the hand at working distance is large).
-            big_hand = rect[2] > 0.18 * image_w
-            if quarantining and not big_hand and hypot(rect[0] - qx, rect[1] - qy) <= qrad:
-                continue
             out = self._landmark_smart(frame_bgr, rect)
             if out is None or not self._spread_ok(out[0], rect, image_w, image_h):
                 continue
             pointing = is_pointing(out[0])
+            # Persistent quarantine zones: a non-pointing candidate inside
+            # a remembered junk zone is dropped (a big close hand — a real
+            # hand near the camera — bypasses); a POINTING candidate in a
+            # zone clears it (intentional use beats the quarantine).
+            zone = next(
+                (
+                    z
+                    for z in self._zones
+                    if hypot(rect[0] - z[0] * image_w, rect[1] - z[1] * image_h)
+                    <= QUARANTINE_RADIUS * min_dim
+                ),
+                None,
+            )
+            if zone is not None and not rect[2] > 0.18 * image_w:
+                if pointing:
+                    self._zones.remove(zone)
+                else:
+                    continue
             if prefer_pointing and prev is not None and not pointing:
                 # Engaged cursor: a far non-pointing candidate must not
                 # steal the hand (face anchor at frame center).

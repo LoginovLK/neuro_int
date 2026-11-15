@@ -64,16 +64,29 @@ def finger_states(pts: list[tuple[float, float]]) -> dict[str, bool]:
 
 
 def is_pointing(pts: list[tuple[float, float]]) -> bool:
-    """The pointing pose: index straight, middle folded.
+    """The pointing pose: index straight, middle folded, index the extremum.
 
     Middle alone separates ☝ from ✌ and the open palm. Ring/pinky are
-    NOT checked: on a hand seen edge-on (knuckles toward the camera, the
-    dark-hoodie case) they misread as extended — the face false
-    positives that motivated the strict rule are already rejected by the
-    palm-cluster filter before this check runs.
+    NOT state-checked: on a hand seen edge-on (knuckles toward the
+    camera, the dark-hoodie case) they misread as extended — the face
+    false positives that motivated the strict rule are already rejected
+    by the palm-cluster filter before this check runs.
+
+    Third condition — the physical invariant of ☝: the index TIP is the
+    farthest fingertip from the wrist (it is the extended one). Junk
+    hallucinations that pass the two state checks almost always put
+    some other fingertip farther out; a real pointing hand never does
+    (0.85 tolerance for edge-on hands where a folded-tip estimate can
+    creep slightly past).
     """
     state = finger_states(pts)
-    return state["index"] and not state["middle"]
+    if not (state["index"] and not state["middle"]):
+        return False
+    di = _dist(pts[WRIST], pts[INDEX_TIP])
+    farthest = max(
+        _dist(pts[WRIST], pts[t]) for t in (MIDDLE_TIP, RING_TIP, PINKY_TIP)
+    )
+    return di >= 0.85 * farthest
 
 
 def palm_ratio(pts: list[tuple[float, float]]) -> float | None:
