@@ -26,15 +26,28 @@ from neuroint_cursor.config import Settings
 from neuroint_cursor.cursor import CursorActuator
 from neuroint_cursor.hands import OnnxHands
 from neuroint_cursor.overlay import draw
-from neuroint_cursor.pose import classify, pinch_center
+from neuroint_cursor.pose import classify, is_zero, pinch_center
 
 logger = logging.getLogger("neuroint_cursor")
+
+# official canned gestures -> state-machine classes. The bundle (fist /
+# closed hand) and the нолик share the closed silhouette, so control
+# from Closed_Fist is split by the strict geometric zero check.
+# point3 (three fingers) and any unrecognized pose ("None") fall back
+# to the geometric classify().
+GESTURE_MAP = {
+    "Closed_Fist": "control",
+    "Pointing_Up": "point1",
+    "Victory": "point2",
+    "Open_Palm": "open",
+}
+GESTURE_MIN_SCORE = 0.55
 
 MODELS = Path(__file__).resolve().parents[2] / "models"
 PALM_MODEL = MODELS / "palm_detection_full_inf_post_192x192.onnx"
 LANDMARK_MODEL = MODELS / "hand_landmark_sparse_Nx3x224x224.onnx"
 FACE_MODEL = MODELS / "face_detection_yunet_2023mar.onnx"
-MP_MODEL = MODELS / "hand_landmarker.task"
+MP_MODEL = MODELS / "gesture_recognizer.task"
 DWPOSE_DET = MODELS / "yolox_l.onnx"
 DWPOSE_POSE = MODELS / "dw-ll_ucoco_384.onnx"
 
@@ -158,10 +171,32 @@ def main() -> int:
                 # off-debounce right after.
                 fresh = (now - getattr(hands, "_last_fresh", now)) <= 0.15
 
-                # gesture classification (fresh results only)
+                # gesture classification (fresh results only). Primary
+                # source: Google's trained canned-gesture classifier
+                # (stable under hand tilt, unlike 2D projection rules);
+                # geometric classify() only for poses it does not cover.
                 state = "none"
                 if fresh and result is not None:
-                    state = classify(result[0])
+                    gname, gscore = getattr(hands, "last_gesture", (None, 0.0))
+                    official = (
+                        GESTURE_MAP.get(gname)
+                        if gscore >= GESTURE_MIN_SCORE
+                        else None
+                    )
+                    if official == "control":
+                        state = "zero" if is_zero(result[0]) else "control"
+                    elif official:
+                        state = official
+                    else:
+                        state = classify(result[0])
+                        # phantom-click kill (measured on Lev's frames):
+                        # 2D projection miscounts fingers on tilted or
+                        # garbage clouds (his open palm read point2, a
+                        # gun grip read point2). CLICKS come only from
+                        # the trained classes; the fallback serves
+                        # motion / scroll / zero / release.
+                        if state in ("point1", "point2"):
+                            state = "control"
                 cls_win.append(state)
                 stable = state if (
                     len(cls_win) >= 3

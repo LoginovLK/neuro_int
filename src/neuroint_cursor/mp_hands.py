@@ -1,10 +1,17 @@
-"""Official MediaPipe HandLandmarker backend (tasks API).
+"""Official MediaPipe GestureRecognizer backend (tasks API).
 
 The hand-tracking industry standard: Google's own pipeline (palm detect ->
 landmark track, all preprocessing matched to training exactly). Everything
 manually ported before (ONNX palm + sparse landmark, DWPose wholebody)
 either slid or hallucinated; this is the reference implementation Lev's
 original v1 used - the quality he remembers.
+
+The recognizer is the landmarker PLUS a trained gesture classifier head:
+instead of hand-written 2D-projection rules (which lie under hand tilt -
+the bundle flickered into point1/zero), each frame gets Google's canned
+gesture (Closed_Fist / Pointing_Up / Victory / Open_Palm / ...) with a
+score. The state machine consumes the official class; geometric checks
+remain only as fallback and to split fist-vs-zero.
 
 Carried over from the rest of the stack: pinch bundle gate, One Euro
 smoothing, shape lock (frozen skeleton re-anchored by a filtered rigid
@@ -64,7 +71,7 @@ class MediaPipeHands:
         import mediapipe as mp
         from mediapipe.tasks.python import vision
 
-        options = vision.HandLandmarkerOptions(
+        options = vision.GestureRecognizerOptions(
             base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),
             running_mode=vision.RunningMode.VIDEO,
             num_hands=2,
@@ -72,11 +79,16 @@ class MediaPipeHands:
             min_hand_presence_confidence=0.5,
             min_tracking_confidence=0.5,
         )
-        self._landmarker = vision.HandLandmarker.create_from_options(options)
+        self._landmarker = vision.GestureRecognizer.create_from_options(options)
         self._mp_image_cls = mp.Image
         self._srgb = mp.ImageFormat.SRGB
         self._last_ts = 0
-        logger.info("mediapipe hand landmarker ready")
+        # official gesture class of the SELECTED hand, refreshed per frame:
+        # (category_name | None, score) - "None" (no canned match) is
+        # normalized to (None, 0.0) so the state machine can fall back to
+        # geometric classification
+        self.last_gesture: tuple[str | None, float] = (None, 0.0)
+        logger.info("mediapipe gesture recognizer ready")
 
         self._face_det = None
         if face_model is not None and Path(face_model).exists():
@@ -120,13 +132,13 @@ class MediaPipeHands:
         # consecutive "video sees a hand / image sees none" the video
         # tracker is REBUILT (a track reset it cannot self-recover from)
         self._vopts = options
-        self._iopts = vision.HandLandmarkerOptions(
+        self._iopts = vision.GestureRecognizerOptions(
             base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),
             running_mode=vision.RunningMode.IMAGE,
             num_hands=2,
             min_hand_detection_confidence=0.5,
         )
-        self._img_lm = vision.HandLandmarker.create_from_options(self._iopts)
+        self._img_lm = vision.GestureRecognizer.create_from_options(self._iopts)
         # The watchdog lives on its OWN daemon thread: a full IMAGE-mode
         # inference inside the 30fps loop stalled one frame every second
         # (Lev: "детекция каждую секунду подтормаживает"). This thread
@@ -160,7 +172,7 @@ class MediaPipeHands:
                 continue
             try:
                 mp_image = self._mp_image_cls(image_format=self._srgb, data=frame)
-                img_res = self._img_lm.detect(mp_image)
+                img_res = self._img_lm.recognize(mp_image)
             except Exception as exc:  # noqa: BLE001 - watchdog must survive
                 logger.debug("watchdog detect failed: %s", exc)
                 continue
@@ -322,7 +334,7 @@ class MediaPipeHands:
 
         rgb = np.ascontiguousarray(frame_bgr[..., ::-1])
         mp_image = self._mp_image_cls(image_format=self._srgb, data=rgb)
-        result = self._landmarker.detect_for_video(mp_image, ts_ms)
+        result = self._landmarker.recognize_for_video(mp_image, ts_ms)
 
         # watchdog bookkeeping (both O(1)): hand the fresh frame copy and
         # the "video saw a hand" verdict to the background watchdog thread.
@@ -342,7 +354,7 @@ class MediaPipeHands:
                 self._landmarker.close()
             except Exception as exc:  # noqa: BLE001 - rebuild must survive
                 logger.debug("landmarker close failed: %s", exc)
-            self._landmarker = vision.HandLandmarker.create_from_options(
+            self._landmarker = vision.GestureRecognizer.create_from_options(
                 self._vopts
             )
             self._coast = None
@@ -358,10 +370,11 @@ class MediaPipeHands:
         diag_due = now_s - self._last_diag >= 5.0
 
         candidates: list[tuple[float, str, list[tuple[float, float]]]] = []
+        cand_gest: list[tuple[str | None, float]] = []
         n_raw = len(result.hand_landmarks)
         min_dim = min(image_w, image_h)
-        for lm_list, handedness in zip(
-            result.hand_landmarks, result.handedness, strict=True
+        for i, (lm_list, handedness) in enumerate(
+            zip(result.hand_landmarks, result.handedness, strict=True)
         ):
             pts = [(lm.x, lm.y) for lm in lm_list]
             xs = [p[0] * image_w for p in pts]
@@ -395,6 +408,14 @@ class MediaPipeHands:
                         continue  # the latch itself: invisible
             cat = handedness[0]
             candidates.append((float(cat.score), cat.category_name, pts))
+            # official canned gesture of THIS hand ("None" -> no match)
+            gcat = None
+            if i < len(result.gestures) and result.gestures[i]:
+                gcat = result.gestures[i][0]
+            if gcat is not None and gcat.category_name != "None":
+                cand_gest.append((gcat.category_name, float(gcat.score)))
+            else:
+                cand_gest.append((None, 0.0))
         if diag_due:
             self._last_diag = now_s
             logger.info(
@@ -426,7 +447,9 @@ class MediaPipeHands:
             pinched = [c for c in candidates if is_pinch(c[2])]
             if pinched:
                 candidates = pinched
-        score, handed, pts21 = max(candidates, key=lambda c: c[0])
+        best_i = max(range(len(candidates)), key=lambda i: candidates[i][0])
+        score, handed, pts21 = candidates[best_i]
+        self.last_gesture = cand_gest[best_i]
 
         # static latch accumulator: a hand frozen in place (center hovers
         # near the window median) without ever pinching is a texture latch

@@ -183,6 +183,7 @@ def is_zero(
     max_hull: float = 1.0,
     max_tip_to_palm: float = 0.5,
     min_curled: int = 4,
+    max_reach: float = 0.9,
 ) -> bool:
     """The 'zero' pose: fingers rolled into tubes toward the palm center.
 
@@ -190,7 +191,11 @@ def is_zero(
     the fingers part-way, which must NOT read as zero (false center
     commands). Gates, palm-length units: ALL 4 fingers curled (tip
     closer to the wrist than its PIP), the tip cluster sits within 0.5
-    palm lengths of the palm center, hand compact.
+    palm lengths of the palm center, hand compact. The REACH gate
+    (tip cluster within 0.9 palm lengths OF THE WRIST) separates zero
+    from the control bundle: a bundle also gathers the tips, but the
+    whole hand stretches forward (measured reach 1.59 on Lev's hand),
+    while a rolled-up нолик keeps everything above the palm.
     """
     hand = _dist(pts[WRIST], pts[MIDDLE_MCP])
     if hand < 1e-6:
@@ -203,6 +208,8 @@ def is_zero(
     if curled < min_curled:
         return False
     cx, cy = pinch_center(pts)
+    if _dist(pts[WRIST], (cx, cy)) > max_reach * hand:
+        return False
     px, py = palm_center(pts)
     if _dist((cx, cy), (px, py)) > max_tip_to_palm * hand:
         return False
