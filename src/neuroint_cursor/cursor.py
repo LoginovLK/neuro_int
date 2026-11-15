@@ -1,4 +1,4 @@
-"""Cursor actuator: mapping + One Euro + pynput (SetCursorPos).
+"""Cursor actuator: mapping + One Euro + median-3 + pynput (SetCursorPos).
 
 DPI awareness is set before reading screen metrics so coordinates match
 physical pixels on scaled displays (otherwise Windows virtualizes them
@@ -8,6 +8,8 @@ and the cursor lands off-target).
 from __future__ import annotations
 
 import sys
+from collections import deque
+from statistics import median
 
 from pynput.mouse import Controller
 
@@ -54,18 +56,22 @@ class CursorActuator:
         self._filter = PointFilter2D(min_cutoff=min_cutoff, beta=beta)
         self._mouse = Controller()
         self._last: tuple[float, float] | None = None
+        # median-of-3 on the filtered target: kills single-frame outliers
+        # (the residual finger twitch amplified by the sensitivity gain)
+        self._median_win: deque[tuple[int, int]] = deque(maxlen=3)
 
     @property
     def sensitivity(self) -> float:
         return self.mapper.sensitivity
 
     def set_sensitivity(self, value: float) -> None:
-        self.mapper.sensitivity = min(3.0, max(0.5, value))
+        self.mapper.sensitivity = min(8.0, max(0.5, value))
 
     def reset(self) -> None:
         """Drop filter history (call when control re-engages)."""
         self._filter.reset()
         self._last = None
+        self._median_win.clear()
 
     def move(self, fx: float, fy: float, now_s: float) -> tuple[int, int]:
         sx, sy = self.mapper.map(fx, fy)
@@ -76,7 +82,11 @@ class CursorActuator:
             if dist > 0.35 * min(self.screen_w, self.screen_h):
                 self._filter.reset()
                 self._last = None
+                self._median_win.clear()
         sx, sy = self._filter.filter(sx, sy, now_s)
         self._last = (sx, sy)
-        self._mouse.position = (int(sx), int(sy))
-        return int(sx), int(sy)
+        self._median_win.append((int(sx), int(sy)))
+        mx = int(median(p[0] for p in self._median_win))
+        my = int(median(p[1] for p in self._median_win))
+        self._mouse.position = (mx, my)
+        return mx, my

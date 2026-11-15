@@ -10,7 +10,7 @@ Pure math, no I/O — unit-testable.
 from __future__ import annotations
 
 MIN_SENS = 0.4
-MAX_SENS = 4.0
+MAX_SENS = 8.0
 
 
 class CursorMapper:

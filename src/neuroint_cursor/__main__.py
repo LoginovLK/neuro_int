@@ -8,10 +8,12 @@ Run:  make run        (debug window)
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import logging
 import logging.handlers
 import queue as queue_mod
+import threading
 import time
 from pathlib import Path
 
@@ -66,6 +68,16 @@ def main() -> int:
     cfg = Settings.load()
     if args.no_window:
         cfg.debug_window = False
+
+    # every mp.Image allocation feeds the Python GC; after ~a minute of
+    # 30fps allocations a generation collect in the hot loop freezes the
+    # cursor - keep gen-0 sweeps on a background timer instead
+    def _gc_sweep() -> None:
+        while True:
+            time.sleep(2.5)
+            gc.collect(0)
+
+    threading.Thread(target=_gc_sweep, name="gc-sweep", daemon=True).start()
 
     cam = Camera(cfg.camera_index, cfg.width, cfg.height, cfg.fps, cfg.mirror)
     try:

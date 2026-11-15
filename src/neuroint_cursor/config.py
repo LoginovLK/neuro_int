@@ -22,8 +22,8 @@ class Settings:
     fps: int = 30
     mirror: bool = True
     sensitivity: float = 1.0
-    min_cutoff: float = 2.0
-    beta: float = 0.01
+    min_cutoff: float = 1.2
+    beta: float = 0.006
     palm_score_threshold: float = 0.4
     landmark_score_threshold: float = 0.25
     debounce_frames: int = 2
@@ -39,7 +39,14 @@ class Settings:
             try:
                 data = json.loads(p.read_text(encoding="utf-8"))
                 known = {f.name for f in fields(cls)}
-                return cls(**{k: v for k, v in data.items() if k in known})
+                cfg = cls(**{k: v for k, v in data.items() if k in known})
+                # migration: old-default smoothing values -> the softer
+                # anti-twitch curve (existing local configs keep loading)
+                if data.get("min_cutoff") == 2.0:
+                    cfg.min_cutoff = 1.2
+                if data.get("beta") == 0.01:
+                    cfg.beta = 0.006
+                return cfg
             except Exception as exc:  # corrupt config -> defaults
                 logging.getLogger(__name__).warning("config %s ignored: %s", p, exc)
         return cls()
