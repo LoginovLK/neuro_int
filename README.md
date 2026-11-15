@@ -89,12 +89,14 @@ DWPose files are unused research artifacts.
 
     git clone https://github.com/LoginovLK/neuro_int.git
     cd neuro_int
-    python -m venv .venv-edge
-    .venv-edge\Scripts\pip install -r requirements.txt
-    make run         :: models download automatically on first run
+    make run
 
-`make models` also runs standalone. `config.json` is tracked in git
-(it holds only settings — sensitivity, smoothing; no secrets), so the
-tuned values travel with the repo: after changing sensitivity live
-(+/- keys) commit and push to carry it to the other machine.
-`captures/`/`logs/` stay gitignored (local diagnostics only).
+That is the whole setup: `make run` creates `.venv-edge`, installs
+`requirements.txt` and downloads the models itself, then starts.
+`make rebuild` re-does the environment from scratch when it breaks.
+No docker on purpose: the webcam is a host DirectShow device and the
+cursor is moved by a host process — a container has access to neither.
+
+`config.json` is machine-local (auto-created with defaults; tune with
+the +/- keys in the debug window). `captures/`/`logs/` are local
+diagnostics, never committed.
