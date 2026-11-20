@@ -211,10 +211,9 @@ def pinch_l_valid(pts: list[tuple[float, float]], close_dist: float) -> bool:
 def pinch_r_valid(
     pts: list[tuple[float, float]], close_dist: float, open_dist: float
 ) -> bool:
-    """RMB pinch guard: thumb-middle closed, index extended (index and
-    thumb clearly apart), so it can never coincide with an LMB pinch."""
-    if not finger_states(pts)["index"]:
-        return False
+    """RMB pinch guard: thumb-middle closed with the thumb-index CLEARLY
+    open — a fist/bundle keeps d48 small, so no finger-extension styling
+    is required (a relaxed hand must not fail the gate)."""
     if pinch_dist(pts, "middle") >= close_dist:
         return False
     return pinch_dist(pts, "index") > open_dist

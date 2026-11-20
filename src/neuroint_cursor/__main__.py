@@ -1,12 +1,15 @@
 """neuroint cursor v3 — industry-standard gesture mouse.
 
-Vocabulary (Ultraleap / Vision Pro / camera-mouse convention):
+Vocabulary (Vision Pro convention — the hand is always active, there is
+NO rest pose; shape flicker can never freeze the cursor):
 
-  open hand          -> MOVE   (cursor follows the index knuckle)
+  any hand in frame  -> MOVE   (cursor follows the index knuckle)
   pinch thumb-index  -> LMB press, release on open (click / hold = drag)
   pinch thumb-middle -> RMB press, release on open
   index+middle (V)   -> SCROLL: vertical hand travel = wheel steps
-  fist / bundle      -> REST: cursor frozen, buttons up
+  fist / bundle      -> cannot click (the d46 fist guard blocks the
+                        press and drops held buttons)
+  hand out of frame  -> release everything, cursor frozen
 
 Run:  make run        (debug window)
       make headless   (без окна)
@@ -33,9 +36,8 @@ from neuroint_cursor.config import Settings
 from neuroint_cursor.cursor import CursorActuator
 from neuroint_cursor.overlay import draw
 from neuroint_cursor.pose import (
+    FIST_GUARD_DELTA,
     INDEX_MCP,
-    is_move_pose,
-    is_rest_pose,
     is_scroll_pose,
     pinch_dist,
     pinch_l_valid,
@@ -45,15 +47,20 @@ from neuroint_cursor.pose import (
 
 logger = logging.getLogger("neuroint_cursor")
 
-# canned-class score for pose CONFIRMATION only (Closed_Fist / Victory /
-# Open_Palm are tilt-stable hints; clicks never come from classes)
+# canned-class score for pose CONFIRMATION only (Victory / Open_Palm are
+# tilt-stable hints; clicks never come from classes)
 OFFICIAL_CONFIRM = 0.5
-# consecutive rest frames before a held button counts as dropped (a pose
-# transition flickers 1-2 frames; five frames means a real fist)
-REST_DROP_FRAMES = 5
+# a held button drops when the hand closes into a fist/bundle: the STRICT
+# fist signature (thumb at the phalanges: d46 small AND no tip gap) for
+# this many consecutive RAW frames. Measured live: a true pinch hold
+# keeps d46 at 0.39-0.79, the gathered bundle at ~0.24 with no tip gap.
+FIST_GUARD_PIP_HOLD = 0.30
+FIST_DROP_FRAMES = 3
 # consecutive frames to enter the scroll pose (transition hand shapes
 # flash two extended fingers for a few frames; a real scroll intent holds)
 SCROLL_FRAMES = 5
+# and to LEAVE it again (a single misread frame must not drop scroll mid-gesture)
+SCROLL_OFF_FRAMES = 3
 # a held button survives hand-tracking gaps up to this long (MediaPipe
 # drops 1-3 frames of tracking under blur; a real hand-out releases here)
 BUTTON_GRACE_S = 0.30
@@ -152,11 +159,11 @@ def main() -> int:
 
     frames = detected = engaged_frames = moved = 0
     engaged = False
-    move_run = 0          # consecutive MOVE-pose frames (engage debounce)
-    idle_run = 0          # consecutive REST/no-hand frames (disengage)
+    move_run = 0          # consecutive hand-present frames (engage debounce)
+    idle_run = 0          # consecutive no-hand frames (disengage)
     scroll_run = 0        # consecutive SCROLL-pose frames
+    scroll_off_run = 0    # consecutive non-scroll frames (scroll exit debounce)
     scroll_active = False
-    rest_run = 0          # consecutive REST frames (button drop)
     lmb_down = rmb_down = False
     # edge-trigger arming: a pinch press only fires when the pinch had
     # fully OPENED first — chatter inside the hysteresis band cannot
@@ -167,11 +174,12 @@ def main() -> int:
     last_fresh_t = time.monotonic()
     d_li_ema: float | None = None
     d_lm_ema: float | None = None
+    fist_run = 0           # consecutive strict-fist frames (hold drop)
     scroll_y_ema: float | None = None
     # per-second pinch telemetry (threshold tuning from live logs)
     win_d48 = win_d46 = win_d412 = 9.9
     win_presses = 0
-    status = "open hand to engage  |  fist = rest"
+    status = "raise a hand to control"
     fps_t = time.monotonic()
     fps_frames = 0
     fps = 0.0
@@ -218,7 +226,9 @@ def main() -> int:
                     # not from a coasting (stale) skeleton
                     last_fresh_t = now
 
-                # ---- pose (fresh frames only) ----
+                # ---- pose (fresh frames only; NO rest pose: a hand in
+                # frame is active in any shape, hand-out is the pause —
+                # the move/rest flicker froze the cursor 44x per session)
                 pose = "none"
                 raw = getattr(hands, "last_raw", None)
                 if fresh and result is not None:
@@ -228,20 +238,12 @@ def main() -> int:
                     official = gscore >= OFFICIAL_CONFIRM
                     if is_scroll_pose(raw) or (official and gname == "Victory"):
                         pose = "scroll"
-                    elif is_move_pose(raw) or (
-                        official and gname in ("Open_Palm", "Pointing_Up")
-                    ):
-                        pose = "move"
-                    elif is_rest_pose(raw) or (official and gname == "Closed_Fist"):
-                        pose = "rest"
-                    elif engaged:
-                        pose = "move"  # ambiguous cloud: keep driving
                     else:
-                        pose = "none"
+                        # any other hand shape drives the cursor
+                        pose = "move"
 
                 move_run = move_run + 1 if pose == "move" else 0
-                idle_run = idle_run + 1 if pose in ("rest", "none") else 0
-                rest_run = rest_run + 1 if pose == "rest" else 0
+                idle_run = idle_run + 1 if pose == "none" else 0
 
                 # ---- engage / disengage ----
                 if (
@@ -272,6 +274,16 @@ def main() -> int:
                     )
                     d_lm_ema = d_lm if d_lm_ema is None else (
                         PINCH_EMA * d_lm + (1 - PINCH_EMA) * d_lm_ema
+                    )
+                    # strict fist signature on RAW values: thumb at the
+                    # phalanges AND no tip gap. A frame the press guard
+                    # itself would accept (clear tip gap) must never
+                    # count toward dropping the hold.
+                    fist_run = (
+                        fist_run + 1
+                        if d46 < FIST_GUARD_PIP_HOLD
+                        and (d46 - d_li) < FIST_GUARD_DELTA
+                        else 0
                     )
                     # arm on a fully open pinch (edge trigger)
                     if d_li > cfg.pinch_open:
@@ -304,21 +316,34 @@ def main() -> int:
                             rmb_pressed_at = last_press_t = now
                             win_presses += 1
                             logger.info("gesture: RMB down d412=%.2f", d_lm)
-                    if lmb_down and (d_li_ema > cfg.pinch_open or rest_run >= REST_DROP_FRAMES):
+                    # release: pinch opened, or the hand closed into a
+                    # fist/bundle (strict signature held 3 raw frames)
+                    if lmb_down and (
+                        d_li_ema > cfg.pinch_open or fist_run >= FIST_DROP_FRAMES
+                    ):
                         if now - lmb_pressed_at >= MIN_HOLD_S:
                             act.release(Button.left)
                             lmb_down = False
-                            logger.info("gesture: LMB up (%s)", "rest" if rest_run >= REST_DROP_FRAMES else "open")
-                    if rmb_down and (d_lm_ema > cfg.pinch_open or rest_run >= REST_DROP_FRAMES):
+                            logger.info(
+                                "gesture: LMB up (%s)",
+                                "fist" if fist_run >= FIST_DROP_FRAMES else "open",
+                            )
+                    if rmb_down and (
+                        d_lm_ema > cfg.pinch_open or fist_run >= FIST_DROP_FRAMES
+                    ):
                         if now - rmb_pressed_at >= MIN_HOLD_S:
                             act.release(Button.right)
                             rmb_down = False
-                            logger.info("gesture: RMB up (%s)", "rest" if rest_run >= REST_DROP_FRAMES else "open")
+                            logger.info(
+                                "gesture: RMB up (%s)",
+                                "fist" if fist_run >= FIST_DROP_FRAMES else "open",
+                            )
                 elif now - last_fresh_t > BUTTON_GRACE_S:
                     _release_buttons()  # hand really gone: never leave a stuck button
 
                 # ---- scroll ----
                 scroll_run = scroll_run + 1 if pose == "scroll" else 0
+                scroll_off_run = scroll_off_run + 1 if pose != "scroll" else 0
                 if (
                     engaged
                     and not lmb_down
@@ -327,10 +352,11 @@ def main() -> int:
                 ):
                     if not scroll_active:
                         scroll_active = True
+                        scroll_off_run = 0
                         scroll_y_ema = raw[INDEX_MCP][1]
                         act.scroll_anchor(scroll_y_ema)
                         logger.info("gesture: scroll mode")
-                elif scroll_active and scroll_run == 0:
+                elif scroll_active and scroll_off_run >= SCROLL_OFF_FRAMES:
                     scroll_active = False
                     scroll_y_ema = None
                     act.scroll_end()
@@ -361,9 +387,9 @@ def main() -> int:
                 elif scroll_active:
                     status = "SCROLL - two fingers, move hand up/down"
                 elif engaged:
-                    status = "MOVE - open hand  |  pinch = click  |  fist = rest"
+                    status = "MOVE - hand drives  |  pinch = click  |  two fingers = scroll"
                 else:
-                    status = "open hand to engage  |  fist = rest"
+                    status = "raise a hand to control"
 
                 frames += 1
                 detected += 1 if result is not None else 0

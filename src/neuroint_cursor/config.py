@@ -23,7 +23,7 @@ class Settings:
     mirror: bool = True
     sensitivity: float = 1.0
     min_cutoff: float = 1.2
-    beta: float = 0.006
+    beta: float = 0.004
     palm_score_threshold: float = 0.4
     landmark_score_threshold: float = 0.25
     # pinch hysteresis, palm-length units: press below the close
@@ -46,12 +46,12 @@ class Settings:
                 data = json.loads(p.read_text(encoding="utf-8"))
                 known = {f.name for f in fields(cls)}
                 cfg = cls(**{k: v for k, v in data.items() if k in known})
-                # migration: old-default smoothing values -> the softer
-                # anti-twitch curve (existing local configs keep loading)
+                # migration: old-default smoothing values -> the current
+                # curve (existing local configs keep loading)
                 if data.get("min_cutoff") == 2.0:
                     cfg.min_cutoff = 1.2
-                if data.get("beta") == 0.01:
-                    cfg.beta = 0.006
+                if data.get("beta") in (0.01, 0.006):
+                    cfg.beta = 0.004
                 return cfg
             except Exception as exc:  # corrupt config -> defaults
                 logging.getLogger(__name__).warning("config %s ignored: %s", p, exc)

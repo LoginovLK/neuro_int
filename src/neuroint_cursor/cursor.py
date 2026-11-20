@@ -25,11 +25,14 @@ MAX_SENS = 8.0
 # ~0) while a deliberate slow aim is persistent (full magnitude) — so
 # the curve can suppress tremor hard without suppressing aim. Speeds
 # are in base-gain screen px/s.
-G_MIN = 0.05
-S_LOW = 150.0
+G_MIN = 0.08
+# freeze band: only NEAR-ZERO speed is suppressed (tremor); deliberate
+# aiming moves 1:1 from ~50 px/s up — an aggressive low curve choked the
+# aiming band and read as jerk (undershoot-overshoot hunting)
+S_FREEZE = 50.0
 S_HIGH = 600.0
 ACCEL_CAP = 3.0
-VEL_EMA = 0.25
+VEL_EMA = 0.15
 # movement pauses longer than this (scroll mode, tracking gap) rebase the
 # reference instead of integrating the whole travel in one frame (the
 # acceleration curve would boost that leap up to ACCEL_CAP)
@@ -126,11 +129,10 @@ class CursorActuator:
         self._anchor_cursor = (float(pos[0]), float(pos[1]))
 
     def _gain_mult(self, speed: float) -> float:
-        """Acceleration curve: steep suppression below S_LOW (a still
-        hand freezes on target), 1:1 through the aiming band, boosted up
-        to ACCEL_CAP on flicks."""
-        if speed < S_LOW:
-            return max(G_MIN, (speed / S_LOW) ** 1.5)
+        """Acceleration curve: near-zero speed freezes on target (tremor),
+        the whole aiming band moves 1:1, flicks boost up to ACCEL_CAP."""
+        if speed < S_FREEZE:
+            return max(G_MIN, (speed / S_FREEZE) ** 1.3)
         if speed < S_HIGH:
             return 1.0
         return min(1.0 + (speed - S_HIGH) / S_HIGH, ACCEL_CAP)
