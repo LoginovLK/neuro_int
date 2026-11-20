@@ -22,7 +22,6 @@ from neuroint_cursor.pose import (  # noqa: E402
 )
 
 CLOSE = 0.32
-OPEN = 0.55
 
 root = Path(__file__).resolve().parents[1]
 hands = MediaPipeHands(root / "models" / "gesture_recognizer.task")
@@ -58,5 +57,5 @@ for name in names:
         f"d_thumb_pip={thumb_pip_dist(pts):.2f} "
         f"d_thumb_middle={pinch_dist(pts, 'middle'):.2f} "
         f"lmb={pinch_l_valid(pts, CLOSE)} "
-        f"rmb={pinch_r_valid(pts, CLOSE, OPEN)}"
+        f"rmb={pinch_r_valid(pts, CLOSE)}"
     )

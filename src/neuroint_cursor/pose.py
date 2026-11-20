@@ -7,7 +7,8 @@ scale-free in units of the palm length (wrist -> middle MCP):
   pinch thumb-index    -> LMB press, release on open (click / hold-drag)
   pinch thumb-middle   -> RMB press, release on open
   index+middle (V)     -> SCROLL: vertical hand travel = wheel steps
-  fist / bundle        -> REST: cursor frozen, buttons up
+  fist / bundle        -> cannot START a click; a held click survives
+                          until the pinch opens or the hand leaves frame
 
 Clicks and drags come from thumb-to-fingertip DISTANCES with hysteresis,
 never from silhouette classification - a distance cannot be faked by
@@ -180,9 +181,20 @@ def is_rest_pose(pts: list[tuple[float, float]]) -> bool:
 
 
 def is_scroll_pose(pts: list[tuple[float, float]]) -> bool:
-    """Victory: index+middle extended, ring+pinky folded (trackpad scroll)."""
+    """Victory: index+middle extended, ring+pinky folded (trackpad scroll).
+
+    The two raised fingers only need to be UP (bend <= 60 degrees): the
+    strict 50-degree straightness flickered on a relaxed V and chattered
+    scroll on/off within 100ms (measured live). Ring+pinky must stay
+    folded, so an open palm never reads as scroll.
+    """
+    up = finger_extended(pts, *FINGERS["index"], max_bend=60.0) and (
+        finger_extended(pts, *FINGERS["middle"], max_bend=60.0)
+    )
+    if not up:
+        return False
     st = finger_states(pts)
-    return st["index"] and st["middle"] and not st["ring"] and not st["pinky"]
+    return not st["ring"] and not st["pinky"]
 
 
 def is_move_pose(pts: list[tuple[float, float]]) -> bool:
@@ -208,15 +220,22 @@ def pinch_l_valid(pts: list[tuple[float, float]], close_dist: float) -> bool:
     return d46 > FIST_GUARD_PIP or (d46 - d48) > FIST_GUARD_DELTA
 
 
-def pinch_r_valid(
-    pts: list[tuple[float, float]], close_dist: float, open_dist: float
-) -> bool:
-    """RMB pinch guard: thumb-middle closed with the thumb-index CLEARLY
-    open — a fist/bundle keeps d48 small, so no finger-extension styling
-    is required (a relaxed hand must not fail the gate)."""
-    if pinch_dist(pts, "middle") >= close_dist:
+# RMB dominance: the middle finger must be the CLOSER pinch partner, not
+# just closed (measured live: a real RMB attempt runs d412 ~0.05 with the
+# half-relaxed index at d48 ~0.18 — the old "index fully open at >0.55"
+# gate blocked every attempt; an LMB bundle sits at d412 ~= d48)
+RMB_DOMINANCE = 0.10
+
+
+def pinch_r_valid(pts: list[tuple[float, float]], close_dist: float) -> bool:
+    """RMB pinch guard: thumb-middle closed AND the middle clearly the
+    closest finger to the thumb (d412 < d48 by a dominance margin). An
+    index pinch keeps d48 smaller, so no finger-extension styling is
+    required — a relaxed hand must not fail the gate."""
+    d412 = pinch_dist(pts, "middle")
+    if d412 >= close_dist:
         return False
-    return pinch_dist(pts, "index") > open_dist
+    return d412 < pinch_dist(pts, "index") - RMB_DOMINANCE
 
 
 def classify(pts: list[tuple[float, float]]) -> str:

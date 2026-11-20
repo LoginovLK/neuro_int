@@ -7,8 +7,9 @@ NO rest pose; shape flicker can never freeze the cursor):
   pinch thumb-index  -> LMB press, release on open (click / hold = drag)
   pinch thumb-middle -> RMB press, release on open
   index+middle (V)   -> SCROLL: vertical hand travel = wheel steps
-  fist / bundle      -> cannot click (the d46 fist guard blocks the
-                        press and drops held buttons)
+  fist / bundle      -> cannot START a click (the d46 guard gates the
+                        press); a click already held lives until the
+                        pinch opens or the hand leaves the frame
   hand out of frame  -> release everything, cursor frozen
 
 Run:  make run        (debug window)
@@ -36,8 +37,8 @@ from neuroint_cursor.config import Settings
 from neuroint_cursor.cursor import CursorActuator
 from neuroint_cursor.overlay import draw
 from neuroint_cursor.pose import (
-    FIST_GUARD_DELTA,
     INDEX_MCP,
+    RMB_DOMINANCE,
     is_scroll_pose,
     pinch_dist,
     pinch_l_valid,
@@ -50,17 +51,17 @@ logger = logging.getLogger("neuroint_cursor")
 # canned-class score for pose CONFIRMATION only (Victory / Open_Palm are
 # tilt-stable hints; clicks never come from classes)
 OFFICIAL_CONFIRM = 0.5
-# a held button drops when the hand closes into a fist/bundle: the STRICT
-# fist signature (thumb at the phalanges: d46 small AND no tip gap) for
-# this many consecutive RAW frames. Measured live: a true pinch hold
-# keeps d46 at 0.39-0.79, the gathered bundle at ~0.24 with no tip gap.
-FIST_GUARD_PIP_HOLD = 0.30
-FIST_DROP_FRAMES = 3
-# consecutive frames to enter the scroll pose (transition hand shapes
-# flash two extended fingers for a few frames; a real scroll intent holds)
+# A held button is dropped ONLY by the pinch opening or the hand leaving
+# the frame — NOT by the hand closing tighter. Measured live: a natural
+# strong pinch evolves into a gathered bundle (d46 collapses to ~0.1)
+# and the old fist-signature drop killed every hold 140-300ms in; the
+# entry d46 gate alone keeps a fist from ever STARTING a click.
+# Scroll pose: consecutive frames to enter (transition shapes flash two
+# extended fingers; a real scroll intent holds)...
 SCROLL_FRAMES = 5
-# and to LEAVE it again (a single misread frame must not drop scroll mid-gesture)
-SCROLL_OFF_FRAMES = 3
+# ...and to LEAVE again — single misreads must not chatter scroll on/off
+# (measured: a 94ms on/off flicker at the old value of 3)
+SCROLL_OFF_FRAMES = 6
 # a held button survives hand-tracking gaps up to this long (MediaPipe
 # drops 1-3 frames of tracking under blur; a real hand-out releases here)
 BUTTON_GRACE_S = 0.30
@@ -174,7 +175,6 @@ def main() -> int:
     last_fresh_t = time.monotonic()
     d_li_ema: float | None = None
     d_lm_ema: float | None = None
-    fist_run = 0           # consecutive strict-fist frames (hold drop)
     scroll_y_ema: float | None = None
     # per-second pinch telemetry (threshold tuning from live logs)
     win_d48 = win_d46 = win_d412 = 9.9
@@ -200,6 +200,16 @@ def main() -> int:
     try:
         while True:
             frame, seq = cam.read()
+            # a dead camera (unplugged mid-drag) freezes seq forever and
+            # read() keeps returning the last old frame — the seq-gated
+            # block below (with its grace release) then never runs again.
+            # Drop held buttons on a stale freshness clock instead; a live
+            # camera keeps last_fresh_t fresh (or has no buttons held).
+            if (
+                (lmb_down or rmb_down)
+                and time.monotonic() - last_fresh_t > BUTTON_GRACE_S + 0.5
+            ):
+                _release_buttons()
             if frame is None:
                 time.sleep(0.02)
                 if deadline is not None and time.monotonic() > deadline + 5:
@@ -278,16 +288,6 @@ def main() -> int:
                     d_lm_ema = d_lm if d_lm_ema is None else (
                         PINCH_EMA * d_lm + (1 - PINCH_EMA) * d_lm_ema
                     )
-                    # strict fist signature on RAW values: thumb at the
-                    # phalanges AND no tip gap. A frame the press guard
-                    # itself would accept (clear tip gap) must never
-                    # count toward dropping the hold.
-                    fist_run = (
-                        fist_run + 1
-                        if d46 < FIST_GUARD_PIP_HOLD
-                        and (d46 - d_li) < FIST_GUARD_DELTA
-                        else 0
-                    )
                     # arm on a fully open pinch (edge trigger)
                     if d_li > cfg.pinch_open:
                         armed_l = True
@@ -312,35 +312,38 @@ def main() -> int:
                                 "gesture: LMB down d48=%.2f d46=%.2f",
                                 d_li, d46,
                             )
-                        elif armed_r and pinch_r_valid(raw, cfg.pinch_close, cfg.pinch_open):
+                        # the raw dominance gate must ALSO hold on the
+                        # smoothed pair: a single bundled frame mid-entry
+                        # into an LMB pinch (d412 spikes below d48) must
+                        # not fire RMB — the EMA converges in 2-3 frames,
+                        # a sustained middle pinch passes it right after
+                        elif (
+                            armed_r
+                            and pinch_r_valid(raw, cfg.pinch_close)
+                            and d_lm_ema < d_li_ema - RMB_DOMINANCE
+                        ):
                             act.press(Button.right)
                             rmb_down = True
                             armed_r = False
                             rmb_pressed_at = last_press_t = now
                             win_presses += 1
                             logger.info("gesture: RMB down d412=%.2f", d_lm)
-                    # release: pinch opened, or the hand closed into a
-                    # fist/bundle (strict signature held 3 raw frames)
-                    if lmb_down and (
-                        d_li_ema > cfg.pinch_open or fist_run >= FIST_DROP_FRAMES
-                    ):
+                    # release: ONLY the pinch opening (or hand-out above /
+                    # grace below). The hand may tighten freely — a natural
+                    # strong pinch settles into a bundle (d46 ~0.1) and the
+                    # old fist-signature drop killed every hold within
+                    # 140-300ms; opening the fingers raises d48 past the
+                    # open threshold and releases cleanly.
+                    if lmb_down and d_li_ema > cfg.pinch_open:
                         if now - lmb_pressed_at >= MIN_HOLD_S:
                             act.release(Button.left)
                             lmb_down = False
-                            logger.info(
-                                "gesture: LMB up (%s)",
-                                "fist" if fist_run >= FIST_DROP_FRAMES else "open",
-                            )
-                    if rmb_down and (
-                        d_lm_ema > cfg.pinch_open or fist_run >= FIST_DROP_FRAMES
-                    ):
+                            logger.info("gesture: LMB up")
+                    if rmb_down and d_lm_ema > cfg.pinch_open:
                         if now - rmb_pressed_at >= MIN_HOLD_S:
                             act.release(Button.right)
                             rmb_down = False
-                            logger.info(
-                                "gesture: RMB up (%s)",
-                                "fist" if fist_run >= FIST_DROP_FRAMES else "open",
-                            )
+                            logger.info("gesture: RMB up")
                 elif now - last_fresh_t > BUTTON_GRACE_S:
                     _release_buttons()  # hand really gone: never leave a stuck button
 
