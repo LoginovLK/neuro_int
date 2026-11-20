@@ -40,6 +40,7 @@ from neuroint_cursor.pose import (
     pinch_dist,
     pinch_l_valid,
     pinch_r_valid,
+    thumb_pip_dist,
 )
 
 logger = logging.getLogger("neuroint_cursor")
@@ -50,12 +51,19 @@ OFFICIAL_CONFIRM = 0.5
 # consecutive rest frames before a held button counts as dropped (a pose
 # transition flickers 1-2 frames; five frames means a real fist)
 REST_DROP_FRAMES = 5
-# consecutive frames to enter/leave the scroll pose
-SCROLL_FRAMES = 3
+# consecutive frames to enter the scroll pose (transition hand shapes
+# flash two extended fingers for a few frames; a real scroll intent holds)
+SCROLL_FRAMES = 5
 # a held button survives hand-tracking gaps up to this long (MediaPipe
 # drops 1-3 frames of tracking under blur; a real hand-out releases here)
 BUTTON_GRACE_S = 0.30
 PINCH_EMA = 0.5
+# after a press, ignore new presses for this long (anti-bounce: a human
+# double-click re-pinches at ~0.25-0.4s, jitter re-fires at 30-60ms)
+PRESS_REFRACTORY_S = 0.15
+# a press shorter than this stretches to it, so the OS always sees a
+# real click instead of a sub-frame blip
+MIN_HOLD_S = 0.08
 
 MODELS = Path(__file__).resolve().parents[2] / "models"
 PALM_MODEL = MODELS / "palm_detection_full_inf_post_192x192.onnx"
@@ -150,10 +158,19 @@ def main() -> int:
     scroll_active = False
     rest_run = 0          # consecutive REST frames (button drop)
     lmb_down = rmb_down = False
+    # edge-trigger arming: a pinch press only fires when the pinch had
+    # fully OPENED first — chatter inside the hysteresis band cannot
+    # re-fire, so one pinch is always exactly one click
+    armed_l = armed_r = False
+    lmb_pressed_at = rmb_pressed_at = 0.0
+    last_press_t = 0.0
     last_fresh_t = time.monotonic()
     d_li_ema: float | None = None
     d_lm_ema: float | None = None
     scroll_y_ema: float | None = None
+    # per-second pinch telemetry (threshold tuning from live logs)
+    win_d48 = win_d46 = win_d412 = 9.9
+    win_presses = 0
     status = "open hand to engage  |  fist = rest"
     fps_t = time.monotonic()
     fps_frames = 0
@@ -246,36 +263,57 @@ def main() -> int:
                 if fresh and result is not None:
                     d_li = pinch_dist(raw, "index")
                     d_lm = pinch_dist(raw, "middle")
+                    d46 = thumb_pip_dist(raw)
+                    win_d48 = min(win_d48, d_li)
+                    win_d46 = min(win_d46, d46)
+                    win_d412 = min(win_d412, d_lm)
                     d_li_ema = d_li if d_li_ema is None else (
                         PINCH_EMA * d_li + (1 - PINCH_EMA) * d_li_ema
                     )
                     d_lm_ema = d_lm if d_lm_ema is None else (
                         PINCH_EMA * d_lm + (1 - PINCH_EMA) * d_lm_ema
                     )
+                    # arm on a fully open pinch (edge trigger)
+                    if d_li > cfg.pinch_open:
+                        armed_l = True
+                    if d_lm > cfg.pinch_open:
+                        armed_r = True
                     if (
                         engaged
                         and not scroll_active
                         and not lmb_down
                         and not rmb_down
+                        and now - last_press_t >= PRESS_REFRACTORY_S
                     ):
                         # press fires on the threshold crossing: zero added
                         # latency (the Jota CHI'13 direct-manipulation rule)
-                        if pinch_l_valid(raw, cfg.pinch_close):
+                        if armed_l and pinch_l_valid(raw, cfg.pinch_close):
                             act.press(Button.left)
                             lmb_down = True
-                            logger.info("gesture: LMB down (pinch index)")
-                        elif pinch_r_valid(raw, cfg.pinch_close, cfg.pinch_open):
+                            armed_l = False
+                            lmb_pressed_at = last_press_t = now
+                            win_presses += 1
+                            logger.info(
+                                "gesture: LMB down d48=%.2f d46=%.2f",
+                                d_li, d46,
+                            )
+                        elif armed_r and pinch_r_valid(raw, cfg.pinch_close, cfg.pinch_open):
                             act.press(Button.right)
                             rmb_down = True
-                            logger.info("gesture: RMB down (pinch middle)")
+                            armed_r = False
+                            rmb_pressed_at = last_press_t = now
+                            win_presses += 1
+                            logger.info("gesture: RMB down d412=%.2f", d_lm)
                     if lmb_down and (d_li_ema > cfg.pinch_open or rest_run >= REST_DROP_FRAMES):
-                        act.release(Button.left)
-                        lmb_down = False
-                        logger.info("gesture: LMB up")
+                        if now - lmb_pressed_at >= MIN_HOLD_S:
+                            act.release(Button.left)
+                            lmb_down = False
+                            logger.info("gesture: LMB up (%s)", "rest" if rest_run >= REST_DROP_FRAMES else "open")
                     if rmb_down and (d_lm_ema > cfg.pinch_open or rest_run >= REST_DROP_FRAMES):
-                        act.release(Button.right)
-                        rmb_down = False
-                        logger.info("gesture: RMB up")
+                        if now - rmb_pressed_at >= MIN_HOLD_S:
+                            act.release(Button.right)
+                            rmb_down = False
+                            logger.info("gesture: RMB up (%s)", "rest" if rest_run >= REST_DROP_FRAMES else "open")
                 elif now - last_fresh_t > BUTTON_GRACE_S:
                     _release_buttons()  # hand really gone: never leave a stuck button
 
@@ -336,7 +374,8 @@ def main() -> int:
                     fps_frames = 0
                     fps_t = now
                     logger.info(
-                        "fps %.1f  hands %s  engaged %s  lmb %s  rmb %s  scroll %s  sens %.1f",
+                        "fps %.1f  hands %s  engaged %s  lmb %s  rmb %s  scroll %s"
+                        "  sens %.1f  pinch min d48 %.2f d46 %.2f d412 %.2f  presses %d",
                         fps,
                         bool(result),
                         engaged,
@@ -344,7 +383,13 @@ def main() -> int:
                         rmb_down,
                         scroll_active,
                         act.sensitivity,
+                        win_d48,
+                        win_d46,
+                        win_d412,
+                        win_presses,
                     )
+                    win_d48 = win_d46 = win_d412 = 9.9
+                    win_presses = 0
 
                 if show_window:
                     canvas = draw(

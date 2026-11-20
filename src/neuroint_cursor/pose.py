@@ -27,6 +27,12 @@ PINKY_MCP, PINKY_PIP, PINKY_TIP = 17, 18, 20
 
 TIP_IDS = (INDEX_TIP, MIDDLE_TIP, RING_TIP, PINKY_TIP)
 
+# fist vs pinch separators: the thumb sits ON the index phalanges in a
+# fist / gathered bundle (thumb-tip to index-PIP ~= thumb-tip to index-TIP)
+# and a phalanx away from the PIP in a true pinch
+FIST_GUARD_PIP = 0.30
+FIST_GUARD_DELTA = 0.10
+
 FINGERS: dict[str, tuple[int, int, int]] = {
     "index": (INDEX_TIP, INDEX_PIP, INDEX_MCP),
     "middle": (MIDDLE_TIP, MIDDLE_PIP, MIDDLE_MCP),
@@ -152,6 +158,20 @@ def pinch_dist(pts: list[tuple[float, float]], finger: str = "index") -> float:
     return _dist(pts[THUMB_TIP], pts[tip]) / hand
 
 
+def thumb_pip_dist(pts: list[tuple[float, float]]) -> float:
+    """Thumb-tip to index-PIP distance, palm units — the fist discriminator.
+
+    A pinch brings the thumb to the index TIP, a full phalanx away from
+    the PIP; a fist wraps the thumb OVER the index phalanges, right at
+    the PIP. This one distance separates the two compact hand shapes
+    that defeated every silhouette-based guard.
+    """
+    hand = palm_length(pts)
+    if hand < 1e-6:
+        return 9.9
+    return _dist(pts[THUMB_TIP], pts[INDEX_PIP]) / hand
+
+
 def is_rest_pose(pts: list[tuple[float, float]]) -> bool:
     """Fist / bundle: no extended fingers and a compact hull."""
     if any(finger_states(pts).values()):
@@ -173,18 +193,19 @@ def is_move_pose(pts: list[tuple[float, float]]) -> bool:
 
 
 def pinch_l_valid(pts: list[tuple[float, float]], close_dist: float) -> bool:
-    """LMB pinch guard: thumb-index closed AND the hand is NOT a fist/bundle.
-
-    A resting fist also puts the thumb near the index tip; the guard
-    requires open shape evidence (a loose finger or a stretched hull),
-    so a fist can never click.
+    """LMB pinch guard: thumb-index TIPS closed AND the thumb is at the
+    TIP, not on the index phalanges (fist / gathered bundle). Measured on
+    real frames: a bundle puts the thumb near BOTH the tip and the PIP
+    (d46 ~= d48 ~= 0.24), a fist puts it ON the PIP (d46 << d48), a true
+    pinch has the tip a phalanx farther (d46 > d48 by a clear margin).
+    Relaxed other fingers no longer matter — the click does not depend
+    on finger styling.
     """
-    if pinch_dist(pts, "index") >= close_dist:
+    d48 = pinch_dist(pts, "index")
+    if d48 >= close_dist:
         return False
-    others = finger_states(pts)
-    if others["middle"] or others["ring"] or others["pinky"]:
-        return True
-    return hull_ratio(pts) > 1.15
+    d46 = thumb_pip_dist(pts)
+    return d46 > FIST_GUARD_PIP or (d46 - d48) > FIST_GUARD_DELTA
 
 
 def pinch_r_valid(
@@ -197,13 +218,6 @@ def pinch_r_valid(
     if pinch_dist(pts, "middle") >= close_dist:
         return False
     return pinch_dist(pts, "index") > open_dist
-
-
-def active_use(pts: list[tuple[float, float]]) -> bool:
-    """Any deliberate-use evidence; unlocks the static texture-latch spot."""
-    if any(finger_states(pts).values()):
-        return True
-    return pinch_dist(pts, "index") < 0.45
 
 
 def classify(pts: list[tuple[float, float]]) -> str:
