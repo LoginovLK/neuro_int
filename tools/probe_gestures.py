@@ -1,8 +1,7 @@
-"""Offline probe: official canned gestures on Lev's saved capture frames.
+"""Offline probe: gesture vocabulary on Lev's saved capture frames.
 
-Incident diagnostics (not a test): shows what the GestureRecognizer maps
-each known frame to, what the geometric fallback says, and whether the
-strict is_zero (with the new reach gate) can false-fire on the bundle.
+Incident diagnostics (not a test): shows pinch distances and pose classes
+per known frame so thresholds can be tuned without a live camera.
 """
 
 import sys
@@ -12,15 +11,17 @@ import cv2
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from neuroint_cursor.mp_hands import MediaPipeHands  # noqa: E402
-from neuroint_cursor.pose import classify, is_zero  # noqa: E402
+from neuroint_cursor.pose import (  # noqa: E402
+    classify,
+    is_rest_pose,
+    is_scroll_pose,
+    pinch_dist,
+    pinch_l_valid,
+    pinch_r_valid,
+)
 
-GESTURE_MAP = {
-    "Closed_Fist": "control",
-    "Pointing_Up": "point1",
-    "Victory": "point2",
-    "Open_Palm": "open",
-}
-GESTURE_MIN_SCORE = 0.55
+CLOSE = 0.28
+OPEN = 0.50
 
 root = Path(__file__).resolve().parents[1]
 hands = MediaPipeHands(root / "models" / "gesture_recognizer.task")
@@ -39,14 +40,21 @@ for name in names:
     if img is None:
         print(f"{name}: READ FAIL")
         continue
+    # still images run inside the coast window: without this the probe
+    # would print the PREVIOUS image's measurements on a miss
+    hands._coast = None
+    hands._sel_wrist = None
     res = hands.detect(img)
     gname, gscore = hands.last_gesture
-    mapped = GESTURE_MAP.get(gname) if gscore >= GESTURE_MIN_SCORE else None
-    pts = res[0][0] if res else None
-    geo = classify(pts) if pts else "none"
-    zero = is_zero(pts) if pts else False
+    pts = getattr(hands, "last_raw", None) or (res[0][0] if res else None)
+    if pts is None:
+        print(f"{name}: no hand")
+        continue
     print(
-        f"{name}: detect={bool(res)} "
-        f"official={gname}({gscore:.2f}) mapped={mapped} "
-        f"geo_fallback={geo} is_zero={zero}"
+        f"{name}: official={gname}({gscore:.2f}) class={classify(pts)} "
+        f"rest={is_rest_pose(pts)} scroll={is_scroll_pose(pts)} "
+        f"d_thumb_index={pinch_dist(pts, 'index'):.2f} "
+        f"d_thumb_middle={pinch_dist(pts, 'middle'):.2f} "
+        f"lmb={pinch_l_valid(pts, CLOSE)} "
+        f"rmb={pinch_r_valid(pts, CLOSE, OPEN)}"
     )

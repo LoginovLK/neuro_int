@@ -1,3 +1,3 @@
-"""neuroint cursor v2 — поднятый указательный палец ведёт курсор. Всё."""
+"""neuroint cursor v3 — gesture mouse: open hand moves, pinch clicks."""
 
-__version__ = "2.0.0"
+__version__ = "3.0.0"

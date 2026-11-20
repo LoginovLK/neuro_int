@@ -1,8 +1,17 @@
-"""Hand poses: the "bundle" (pinch) engages the cursor.
+"""Hand poses: the industry-standard gesture vocabulary.
 
-The bundle: all four fingertips gathered into one point — comfortable to
-hold (no extended finger to fatigue). Scale-free checks, units of the
-palm length (wrist -> middle MCP).
+Scheme (Ultraleap / Vision Pro / camera-mouse convention), all checks
+scale-free in units of the palm length (wrist -> middle MCP):
+
+  open hand            -> MOVE  (cursor follows the index knuckle)
+  pinch thumb-index    -> LMB press, release on open (click / hold-drag)
+  pinch thumb-middle   -> RMB press, release on open
+  index+middle (V)     -> SCROLL: vertical hand travel = wheel steps
+  fist / bundle        -> REST: cursor frozen, buttons up
+
+Clicks and drags come from thumb-to-fingertip DISTANCES with hysteresis,
+never from silhouette classification - a distance cannot be faked by
+hand tilt (the old 2D-projection counts misread tilted palms as clicks).
 """
 
 from __future__ import annotations
@@ -10,6 +19,7 @@ from __future__ import annotations
 from math import acos, degrees, sqrt
 
 WRIST = 0
+THUMB_TIP = 4
 INDEX_MCP, INDEX_PIP, INDEX_TIP = 5, 6, 8
 MIDDLE_MCP, MIDDLE_PIP, MIDDLE_TIP = 9, 10, 12
 RING_MCP, RING_PIP, RING_TIP = 13, 14, 16
@@ -27,6 +37,11 @@ FINGERS: dict[str, tuple[int, int, int]] = {
 
 def _dist(a: tuple[float, float], b: tuple[float, float]) -> float:
     return sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
+
+
+def palm_length(pts: list[tuple[float, float]]) -> float:
+    """Wrist -> middle MCP: the scale unit for every threshold."""
+    return _dist(pts[WRIST], pts[MIDDLE_MCP])
 
 
 def _bend_deg(tip: tuple[float, float], pip: tuple[float, float], mcp: tuple[float, float]) -> float:
@@ -65,7 +80,7 @@ def finger_states(pts: list[tuple[float, float]]) -> dict[str, bool]:
 
 
 def pinch_center(pts: list[tuple[float, float]]) -> tuple[float, float]:
-    """Center of the fingertip bundle — the cursor control point."""
+    """Center of the four fingertips (the old bundle point; coast velocity)."""
     xs = sum(pts[i][0] for i in TIP_IDS)
     ys = sum(pts[i][1] for i in TIP_IDS)
     return xs / len(TIP_IDS), ys / len(TIP_IDS)
@@ -99,25 +114,26 @@ def _hull_area(points: list[tuple[float, float]]) -> float:
     return abs(area) / 2.0
 
 
+def hull_ratio(pts: list[tuple[float, float]]) -> float:
+    """Convex-hull area of all 21 points, in palm^2 units."""
+    hand = palm_length(pts)
+    if hand < 1e-6:
+        return 0.0
+    return _hull_area(pts) / (hand * hand)
+
+
 def is_pinch(
     pts: list[tuple[float, float]],
     max_hull: float = 1.0,
     min_reach: float = 0.6,
     max_reach: float = 1.9,
 ) -> bool:
-    """The bundle pose: fingertips gathered compactly over the palm.
+    """The legacy BUNDLE pose (four tips gathered, hand stretched forward).
 
-    Measured on real frames (MediaPipe landmarks, scale-free, units of
-    the palm length wrist -> middle MCP): the CONVEX HULL of the 21
-    points is the one feature that separates the poses — a bundled hand
-    keeps its tips INSIDE the palm outline (hull <= 1.0 palm^2), an
-    open palm stretches it (1.5+). The old per-finger state checks were
-    indistinguishable under foreshortening (tip-cluster radius 0.41 on
-    the bundled hand vs 0.44 on the open palm — identical). The reach
-    gate keeps the cluster in front of the palm, not collapsed onto the
-    wrist.
+    Not a click: it is one of the compact REST shapes. Kept for the ONNX
+    fallback backend's candidate bonus / quarantine logic.
     """
-    hand = _dist(pts[WRIST], pts[MIDDLE_MCP])
+    hand = palm_length(pts)
     if hand < 1e-6:
         return False
     cx, cy = pinch_center(pts)
@@ -127,93 +143,78 @@ def is_pinch(
     return _hull_area(pts) <= max_hull * hand * hand
 
 
-def palm_center(pts: list[tuple[float, float]]) -> tuple[float, float]:
-    """Center of the palm: mean of wrist, index MCP, pinky MCP."""
-    px = (pts[0][0] + pts[5][0] + pts[17][0]) / 3
-    py = (pts[0][1] + pts[5][1] + pts[17][1]) / 3
-    return px, py
+def pinch_dist(pts: list[tuple[float, float]], finger: str = "index") -> float:
+    """Thumb-tip to fingertip distance in palm-length units."""
+    hand = palm_length(pts)
+    if hand < 1e-6:
+        return 9.9
+    tip = {"index": INDEX_TIP, "middle": MIDDLE_TIP}[finger]
+    return _dist(pts[THUMB_TIP], pts[tip]) / hand
 
 
-def extended_finger_count(pts: list[tuple[float, float]]) -> int:
-    """How many fingers point forward, STRICTLY: the tip is farther from
-    the wrist than its PIP by a real margin AND the finger is straight
-    (PIP bend < 45 deg). A loose count flickers 1..3 on an open palm and
-    spams clicks; the strict count keeps an open palm at 4 (open) and a
-    closed hand at 0 (control).
+def is_rest_pose(pts: list[tuple[float, float]]) -> bool:
+    """Fist / bundle: no extended fingers and a compact hull."""
+    if any(finger_states(pts).values()):
+        return False
+    return hull_ratio(pts) <= 1.0
+
+
+def is_scroll_pose(pts: list[tuple[float, float]]) -> bool:
+    """Victory: index+middle extended, ring+pinky folded (trackpad scroll)."""
+    st = finger_states(pts)
+    return st["index"] and st["middle"] and not st["ring"] and not st["pinky"]
+
+
+def is_move_pose(pts: list[tuple[float, float]]) -> bool:
+    """Anything open and not scroll/rest: the cursor-driving pose."""
+    if is_rest_pose(pts) or is_scroll_pose(pts):
+        return False
+    return any(finger_states(pts).values()) or hull_ratio(pts) > 1.0
+
+
+def pinch_l_valid(pts: list[tuple[float, float]], close_dist: float) -> bool:
+    """LMB pinch guard: thumb-index closed AND the hand is NOT a fist/bundle.
+
+    A resting fist also puts the thumb near the index tip; the guard
+    requires open shape evidence (a loose finger or a stretched hull),
+    so a fist can never click.
     """
-    n = 0
-    for _name, (tip, pip, mcp) in FINGERS.items():
-        if _dist(pts[WRIST], pts[tip]) <= _dist(pts[WRIST], pts[pip]) * 1.25:
-            continue
-        if _bend_deg(pts[tip], pts[pip], pts[mcp]) > 45.0:
-            continue
-        n += 1
-    return n
+    if pinch_dist(pts, "index") >= close_dist:
+        return False
+    others = finger_states(pts)
+    if others["middle"] or others["ring"] or others["pinky"]:
+        return True
+    return hull_ratio(pts) > 1.15
+
+
+def pinch_r_valid(
+    pts: list[tuple[float, float]], close_dist: float, open_dist: float
+) -> bool:
+    """RMB pinch guard: thumb-middle closed, index extended (index and
+    thumb clearly apart), so it can never coincide with an LMB pinch."""
+    if not finger_states(pts)["index"]:
+        return False
+    if pinch_dist(pts, "middle") >= close_dist:
+        return False
+    return pinch_dist(pts, "index") > open_dist
+
+
+def active_use(pts: list[tuple[float, float]]) -> bool:
+    """Any deliberate-use evidence; unlocks the static texture-latch spot."""
+    if any(finger_states(pts).values()):
+        return True
+    return pinch_dist(pts, "index") < 0.45
 
 
 def classify(pts: list[tuple[float, float]]) -> str:
-    """Gesture class for the state machine.
-
-    'zero'   — fingers rolled into tubes to the palm center: center cursor
-    'point1' — index only: left click
-    'point2' — index+middle: right click
-    'point3' — three fingers: middle press (hold + move = scroll)
-    'open'   — open palm: release everything
-    'control'— anything closed in between: the cursor-driving pose
-    """
-    hand = _dist(pts[WRIST], pts[MIDDLE_MCP])
-    if hand < 1e-6:
-        return "control"
-    if is_zero(pts):
-        return "zero"
-    n = extended_finger_count(pts)
-    if n >= 4:
-        return "open"
-    if n == 1:
-        return "point1"
-    if n == 2:
-        return "point2"
-    if n == 3:
-        return "point3"
-    return "control"
-
-
-def is_zero(
-    pts: list[tuple[float, float]],
-    max_hull: float = 1.0,
-    max_tip_to_palm: float = 0.5,
-    min_curled: int = 4,
-    max_reach: float = 0.9,
-) -> bool:
-    """The 'zero' pose: fingers rolled into tubes toward the palm center.
-
-    Strict on purpose: a circular hand motion tilts the palm and bends
-    the fingers part-way, which must NOT read as zero (false center
-    commands). Gates, palm-length units: ALL 4 fingers curled (tip
-    closer to the wrist than its PIP), the tip cluster sits within 0.5
-    palm lengths of the palm center, hand compact. The REACH gate
-    (tip cluster within 0.9 palm lengths OF THE WRIST) separates zero
-    from the control bundle: a bundle also gathers the tips, but the
-    whole hand stretches forward (measured reach 1.59 on Lev's hand),
-    while a rolled-up нолик keeps everything above the palm.
-    """
-    hand = _dist(pts[WRIST], pts[MIDDLE_MCP])
-    if hand < 1e-6:
-        return False
-    curled = sum(
-        1
-        for tip, pip, _mcp in FINGERS.values()
-        if _dist(pts[WRIST], pts[tip]) < _dist(pts[WRIST], pts[pip]) * 1.05
-    )
-    if curled < min_curled:
-        return False
-    cx, cy = pinch_center(pts)
-    if _dist(pts[WRIST], (cx, cy)) > max_reach * hand:
-        return False
-    px, py = palm_center(pts)
-    if _dist((cx, cy), (px, py)) > max_tip_to_palm * hand:
-        return False
-    return _hull_area(pts) <= max_hull * hand * hand
+    """Coarse shape class (shape-lock refit trigger only, not clicks)."""
+    if is_rest_pose(pts):
+        return "rest"
+    if is_scroll_pose(pts):
+        return "scroll"
+    if is_move_pose(pts):
+        return "move"
+    return "other"
 
 
 def palm_ratio(pts: list[tuple[float, float]]) -> float | None:

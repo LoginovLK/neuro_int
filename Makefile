@@ -1,4 +1,4 @@
-# neuro_int v2 — gesture mouse. One process. git clone -> make run.
+# neuro_int v3 — gesture mouse (open hand + pinch). One process. git clone -> make run.
 
 .DEFAULT_GOAL := help
 VENV_DIR := .venv-edge
@@ -30,13 +30,13 @@ $(REQ_STAMP): requirements.txt | $(VENV_PY)
 models: ## download model files into models/ (no-op once cached)
 	$(PY) tools/fetch_models.py
 
-run: $(REQ_STAMP) models ## control the cursor with the bundle (debug window; q quits)
+run: $(REQ_STAMP) models ## gesture mouse: open hand moves, pinch clicks (debug window; q quits)
 	$(ENV) $(VENV_PY) -m neuroint_cursor
 
 headless: $(REQ_STAMP) models ## same, without the debug window
 	$(ENV) $(VENV_PY) -m neuroint_cursor --no-window
 
-smoke: $(REQ_STAMP) models ## 12s self-check: camera + GPU + detection (mouse untouched)
+smoke: $(REQ_STAMP) models ## 12s self-check: camera + detector (mouse untouched)
 	$(ENV) $(VENV_PY) -m neuroint_cursor --no-window --dry --smoke 12
 
 diag: ## 8s capture with your hand at the camera -> captures/diag_hands.png

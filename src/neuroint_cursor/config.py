@@ -26,6 +26,11 @@ class Settings:
     beta: float = 0.006
     palm_score_threshold: float = 0.4
     landmark_score_threshold: float = 0.25
+    # pinch hysteresis, palm-length units: press below the close
+    # threshold, release above the open one (the ~2x gap kills flicker,
+    # the same enter/exit separation MRTK and Ultraleap use)
+    pinch_close: float = 0.28
+    pinch_open: float = 0.50
     debounce_frames: int = 2
     debounce_off_frames: int = 10
     tracking: bool = True

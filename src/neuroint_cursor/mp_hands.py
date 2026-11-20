@@ -7,15 +7,14 @@ either slid or hallucinated; this is the reference implementation Lev's
 original v1 used - the quality he remembers.
 
 The recognizer is the landmarker PLUS a trained gesture classifier head:
-instead of hand-written 2D-projection rules (which lie under hand tilt -
-the bundle flickered into point1/zero), each frame gets Google's canned
-gesture (Closed_Fist / Pointing_Up / Victory / Open_Palm / ...) with a
-score. The state machine consumes the official class; geometric checks
-remain only as fallback and to split fist-vs-zero.
+each frame gets Google's canned gesture (Closed_Fist / Victory /
+Open_Palm / ...) with a score. The canned classes only CONFIRM poses
+(tilt-stable evidence); clicks and drags are distance-based on the raw
+landmarks (thumb-to-fingertip), which tilt cannot fake.
 
-Carried over from the rest of the stack: pinch bundle gate, One Euro
-smoothing, shape lock (frozen skeleton re-anchored by a filtered rigid
-transform), still-pinch sticker lockout, YuNet face gate.
+Carried over from the rest of the stack: One Euro smoothing, shape lock
+(frozen skeleton re-anchored by a filtered rigid transform), static
+texture-latch lockout, YuNet face gate.
 """
 
 from __future__ import annotations
@@ -33,14 +32,11 @@ import numpy as np
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 
-from neuroint_cursor.pose import classify, is_pinch, pinch_center
+from neuroint_cursor.pose import active_use, classify, palm_length
 from neuroint_cursor.smoothing import PointFilter2D
 
 logger = logging.getLogger(__name__)
 
-STILL_PINCH_SECONDS = 5.0
-STILL_TIP_SPREAD = 0.02
-LOCK_UNLOCK_PX = 0.06
 SHAPE_REFIT = 0.55
 # fingertip divergence alone forces an instant re-freeze: when the gesture
 # changes, only the tips move (the palm stays), the all-point median never
@@ -50,13 +46,13 @@ TIPS_REFIT = 0.40
 TIPS = (8, 12, 16, 20)
 # static texture-latch (hair/chair stick): the VIDEO tracker latches onto
 # textures and redraws a hand forever; IMAGE-mode on the same frame finds
-# nothing. A non-pinch hand frozen in place for this long is locked out.
+# nothing. A hand frozen in place for this long while the cursor is NOT
+# engaged is locked out.
 STATIC_LATCH_SECONDS = 4.0
-# coast: when tracking drops (fast swipe, blur) keep the last skeleton and
-# carry it along the last bundle velocity instead of blinking off and
-# re-drawing at the new spot
+# coast: when tracking drops (fast swipe, blur) keep the last skeleton
+# FROZEN in place instead of blinking off and re-drawing at the new spot.
+# Absolute deadline: _last_fresh only moves on REAL detections.
 COAST_SECONDS = 0.35
-COAST_VEL_CAP = 1500.0  # px/s
 
 
 class MediaPipeHands:
@@ -85,9 +81,13 @@ class MediaPipeHands:
         self._last_ts = 0
         # official gesture class of the SELECTED hand, refreshed per frame:
         # (category_name | None, score) - "None" (no canned match) is
-        # normalized to (None, 0.0) so the state machine can fall back to
-        # geometric classification
+        # normalized to (None, 0.0). The canned classes (Closed_Fist,
+        # Victory, ...) only CONFIRM poses; clicks are distance-based.
         self.last_gesture: tuple[str | None, float] = (None, 0.0)
+        # RAW (un-shaped, un-smoothed) normalized landmarks of the selected
+        # hand: gesture distances (thumb-to-fingertip pinch) must read the
+        # live cloud - a frozen shape would freeze the pinch distance too.
+        self.last_raw: list[tuple[float, float]] | None = None
         logger.info("mediapipe gesture recognizer ready")
 
         self._face_det = None
@@ -108,22 +108,22 @@ class MediaPipeHands:
         self._anchor_f: PointFilter2D | None = None
         self._ang_vec: tuple[float, float] | None = None
         self._hand_f = 0.0
-        self._tip_hist: deque[tuple[float, float, float]] = deque()
-        self._lock: tuple[float, float, float, float] | None = None
-        self._lock_seen = 0.0
+        # wrist of the last selected hand (normalized): sticky selection
+        # keeps ONE hand while the cursor is engaged instead of flipping
+        # between two candidates on score crossings
+        self._sel_wrist: tuple[float, float] | None = None
         self._last_diag = 0.0
         self._coast: tuple[list[tuple[float, float]], str, float] | None = None
-        self._coast_t = 0.0
-        self._bundle_prev: tuple[float, float] | None = None
-        self._bundle_vel: tuple[float, float] = (0.0, 0.0)
         # timestamp of the last REAL detection (coast does not update it):
-        # control logic treats results older than ~0.1s as "no hand"
+        # control logic treats results older than ~0.15s as "no hand", and
+        # the coast window ends COAST_SECONDS after it
         self._last_fresh = 0.0
         # static hallucination lock (Lev's hair stick): MediaPipe's VIDEO
         # tracker latches onto textures (hair, chair) and re-draws a hand
         # forever; IMAGE-mode on the same frame finds nothing. A candidate
-        # that stays put (box IoU / center median) for 2.5s without ever
-        # pinching is locked out until a pinch lands on that spot.
+        # that stays put (box IoU / center median) for STATIC_LATCH_SECONDS
+        # while the cursor is NOT engaged is locked out; deliberate use at
+        # that spot (open hand / pinch) re-opens it.
         self._shist: deque[tuple[float, float, float, float, float]] = deque()
         self._slock: tuple[float, float, float, float] | None = None
         # tracker-latch watchdog: the VIDEO landmarker latches onto
@@ -144,8 +144,7 @@ class MediaPipeHands:
         # (Lev: "детекция каждую секунду подтормаживает"). This thread
         # only ever touches _img_lm; the main loop only touches
         # _landmarker — no shared landmarker, no locks needed.
-        self._watch_frame: np.ndarray | None = None
-        self._watch_has_hand = False
+        self._watch: tuple[np.ndarray, bool] | None = None
         self._stale_strikes = 0
         self._stale_trigger = False
         threading.Thread(
@@ -166,10 +165,11 @@ class MediaPipeHands:
             time.sleep(1.0)
             if self._stale_trigger:
                 continue  # a rebuild is already queued, wait for it
-            frame = self._watch_frame
-            if frame is None or not self._watch_has_hand:
+            watch = self._watch
+            if watch is None or not watch[1]:
                 self._stale_strikes = 0
                 continue
+            frame = watch[0]
             try:
                 mp_image = self._mp_image_cls(image_format=self._srgb, data=frame)
                 img_res = self._img_lm.recognize(mp_image)
@@ -279,48 +279,6 @@ class MediaPipeHands:
             )
         ]
 
-    def _sticker_check(
-        self,
-        points: list[tuple[float, float]],
-        pinch_now: bool,
-        now_s: float,
-        image_w: int,
-        image_h: int,
-    ) -> bool:
-        min_dim = min(image_w, image_h)
-        bfx, bfy = pinch_center(points)
-        cx, cy = bfx * image_w, bfy * image_h
-        if self._lock is not None:
-            moved = hypot(cx - self._lock[0], cy - self._lock[1])
-            if not pinch_now or moved > LOCK_UNLOCK_PX * min_dim:
-                self._lock = None
-            else:
-                if now_s - self._lock_seen > 0.5:
-                    self._lock_seen = now_s
-                return True
-        if pinch_now:
-            self._tip_hist.append((now_s, cx, cy))
-            horizon = now_s - STILL_PINCH_SECONDS
-            while self._tip_hist and self._tip_hist[0][0] < horizon:
-                self._tip_hist.popleft()
-            if (
-                len(self._tip_hist) >= 30
-                and self._tip_hist[-1][0] - self._tip_hist[0][0]
-                >= STILL_PINCH_SECONDS * 0.8
-            ):
-                xs = [x for _, x, _y in self._tip_hist]
-                ys = [y for _, _x, y in self._tip_hist]
-                if hypot(max(xs) - min(xs), max(ys) - min(ys)) <= STILL_TIP_SPREAD * min_dim:
-                    self._lock = (cx, cy, 0.0, 0.0)
-                    self._lock_seen = now_s
-                    self._tip_hist.clear()
-                    self._coast = None  # a locked sticker must not coast
-                    logger.warning("still-pinch sticker locked out")
-                    return True
-        else:
-            self._tip_hist.clear()
-        return False
-
     # ---------------- public ----------------
 
     def detect(
@@ -336,12 +294,11 @@ class MediaPipeHands:
         mp_image = self._mp_image_cls(image_format=self._srgb, data=rgb)
         result = self._landmarker.recognize_for_video(mp_image, ts_ms)
 
-        # watchdog bookkeeping (both O(1)): hand the fresh frame copy and
-        # the "video saw a hand" verdict to the background watchdog thread.
-        # `rgb` is a unique array per frame and never mutated afterwards,
-        # so the watchdog can safely read it a second later.
-        self._watch_frame = rgb
-        self._watch_has_hand = bool(result.hand_landmarks)
+        # watchdog bookkeeping (O(1)): publish the fresh frame and the
+        # "video saw a hand" verdict as ONE tuple so the background thread
+        # always reads a matching pair. `rgb` is a unique array per frame
+        # and never mutated afterwards.
+        self._watch = (rgb, bool(result.hand_landmarks))
 
         # the watchdog thread flagged a texture latch (2 strikes): rebuild
         # the VIDEO tracker here on the main thread — it owns _landmarker.
@@ -364,6 +321,8 @@ class MediaPipeHands:
             self._anchor_f = None
             self._ang_vec = None
             self._filters = None
+            self._sel_wrist = None
+            self.last_raw = None
             return []
 
         faces = self._face_boxes(frame_bgr)
@@ -391,8 +350,8 @@ class MediaPipeHands:
             if on_face:
                 continue
             # static latch: the frozen hand occupying the locked spot is
-            # invisible; a pinch at that spot re-opens the lock (a real
-            # hand came back)
+            # invisible; deliberate use at that spot (open hand or pinch)
+            # re-opens the lock
             if self._slock is not None:
                 lx0, ly0, lx1, ly1 = self._slock
                 ioux = min(max(xs), lx1) - max(min(xs), lx0)
@@ -402,8 +361,8 @@ class MediaPipeHands:
                 a2 = (lx1 - lx0) * (ly1 - ly0)
                 iou = inter / max(a1 + a2 - inter, 1e-6)
                 if iou >= 0.25:
-                    if is_pinch(pts):
-                        self._slock = None  # a real hand retook the spot
+                    if active_use(pts):
+                        self._slock = None  # deliberate use retook the spot
                     else:
                         continue  # the latch itself: invisible
             cat = handedness[0]
@@ -426,30 +385,44 @@ class MediaPipeHands:
             )
         if not candidates:
             # coast: no blink-off — the last skeleton stays FROZEN in
-            # place (velocity flight dragged the cursor and read as the
-            # sens going crazy)
+            # place, at most COAST_SECONDS past the last real detection
             if (
                 self._coast is not None
-                and self._lock is None
-                and now_s - self._coast_t <= COAST_SECONDS
+                and now_s - self._last_fresh <= COAST_SECONDS
             ):
                 pts, handed, score = self._coast
-                self._coast_t = now_s
                 return [(pts, handed, score)]
             self._shape = None
             self._anchor_f = None
             self._ang_vec = None
             self._filters = None
-            self._bundle_prev = None
-            self._bundle_vel = (0.0, 0.0)
+            self._sel_wrist = None
+            self.last_raw = None
             return []
-        if prefer_pinch:
-            pinched = [c for c in candidates if is_pinch(c[2])]
-            if pinched:
-                candidates = pinched
-        best_i = max(range(len(candidates)), key=lambda i: candidates[i][0])
+        # sticky selection while engaged: keep the hand whose wrist is near
+        # the previously selected one (within ~1.5 palm lengths) instead of
+        # flipping between two candidates when scores cross
+        best_i = 0
+        if prefer_pinch and self._sel_wrist is not None:
+            near = [
+                i
+                for i, (_s, _h, pts) in enumerate(candidates)
+                if palm_length(pts) > 1e-6
+                and hypot(
+                    pts[0][0] - self._sel_wrist[0], pts[0][1] - self._sel_wrist[1]
+                )
+                <= 1.5 * palm_length(pts)
+            ]
+            if near:
+                best_i = max(near, key=lambda i: candidates[i][0])
+            else:
+                best_i = max(range(len(candidates)), key=lambda i: candidates[i][0])
+        else:
+            best_i = max(range(len(candidates)), key=lambda i: candidates[i][0])
         score, handed, pts21 = candidates[best_i]
+        self._sel_wrist = pts21[0]
         self.last_gesture = cand_gest[best_i]
+        self.last_raw = pts21
 
         # static latch accumulator: a hand frozen in place (center hovers
         # near the window median) without ever pinching is a texture latch
@@ -460,7 +433,7 @@ class MediaPipeHands:
             max(p[0] for p in pts_px),
             max(p[1] for p in pts_px),
         )
-        if is_pinch(pts21) or prefer_pinch:
+        if prefer_pinch:
             self._shist.clear()
         else:
             self._shist.append((now_s, *bb))
@@ -492,26 +465,6 @@ class MediaPipeHands:
             )
         points = self._smooth(shaped, now_s)
 
-        # bundle velocity for coasting
-        bfx, bfy = pinch_center(points)
-        bx, by = bfx * image_w, bfy * image_h
-        if self._bundle_prev is not None:
-            dt = max(now_s - self._coast_t, 1 / 120)
-            nvx = (bx - self._bundle_prev[0]) / dt
-            nvy = (by - self._bundle_prev[1]) / dt
-            nvx = max(min(nvx, COAST_VEL_CAP), -COAST_VEL_CAP)
-            nvy = max(min(nvy, COAST_VEL_CAP), -COAST_VEL_CAP)
-            self._bundle_vel = (
-                0.6 * self._bundle_vel[0] + 0.4 * nvx,
-                0.6 * self._bundle_vel[1] + 0.4 * nvy,
-            )
-        self._bundle_prev = (bx, by)
-
-        pinch_now = is_pinch(points)
-        if self._sticker_check(points, pinch_now, now_s, image_w, image_h):
-            self._coast = None
-            return []
         self._coast = (points, handed, score)
-        self._coast_t = now_s
         self._last_fresh = now_s
         return [(points, handed, score)]

@@ -1,8 +1,28 @@
-# neuro_int — курсор по указательному пальцу
+# neuro_int — жестовая мышь (веб-камера)
 
-Поднимаешь ☝ — курсор на ПК едет туда, куда указывает палец. Опускаешь (или
-убираешь руку) — курсор замирает. Всё. Остальной функционал (жесты, клики,
-клавиши, docker-стек, веб-UI) удалён.
+Промышленный стандарт жестов (Ultraleap / Apple Vision Pro / самые
+звёздные virtual-mouse проекты): один примитив — щипок — плюс открытая
+рука. Никаких силуэтных «показал N пальцев → клик»: клик читается по
+дистанции между кончиками большого и указательного, а дистанции не
+ломаются наклоном руки.
+
+## Жесты
+
+| жест | действие |
+|---|---|
+| открытая рука | движение курсора (точка управления — костяшка указательного) |
+| щипок большой + указательный | ЛКМ: нажал — держится; разжал — отпустил |
+| щипок (ЛКМ) + движение руки | перетаскивание (drag) |
+| два быстрых щипка | двойной клик (ОС сама распознаёт) |
+| щипок большой + средний | ПКМ (нажал/отпустил) |
+| два пальца (указательный + средний, ✌) | скролл: вертикальное движение руки = колесо |
+| кулак / пучок | покой: курсор заморожен, кнопки отпущены |
+| рука убрана из кадра | отпуск всего, курсор заморожен |
+
+Курсор относительный (как тачпад): при захвате курсор остаётся где был,
+дальше движется дельта руки × сенса. Смена жеста не сбивает позицию —
+костяшка указательного не двигается при щипке, клик падает туда, где
+курсор.
 
 ## Запуск
 
@@ -10,80 +30,64 @@
 make run        # окно камеры + управление курсором (q — выход)
 make headless   # без окна
 make smoke      # 12с самопроверка камеры/GPU/детекта (мышь не трогает)
-make test       # юнит-тесты
+make lint       # ruff
 ```
 
-Venv `.venv-edge` уже на месте (onnxruntime-directml, opencv, pynput, numpy).
+Первая команда после `git clone` — `make run`: сам создаёт `.venv-edge`,
+ставит зависимости и скачивает модели.
 
 ## Настройки
 
-`config.json` в корне. Сенса меняется на лету клавишами `+` / `-` в окне
-(шаг 0.2, сохраняется сразу):
+`config.json` в корне (создаётся сам). Сенса меняется на лету клавишами
+`+` / `-` в окне (шаг 0.2, сохраняется сразу):
 
 | ключ | дефолт | что делает |
 |---|---|---|
-| `sensitivity` | 1.0 | размер активной зоны кадра: больше = резче курсор |
-| `min_cutoff` / `beta` | 1.2 / 0.01 | One Euro: плавность против дрожи |
+| `sensitivity` | 1.0 | гейн: больше = резче курсор (0.5–8.0) |
+| `min_cutoff` / `beta` | 1.2 / 0.006 | One Euro: плавность против дрожи |
+| `pinch_close` / `pinch_open` | 0.28 / 0.50 | гистерезис щипка (доли длины ладони) |
 | `camera_index` | 0 | какая вебка |
 | `mirror` | true | зеркало кадра |
 | `debug_window` | true | окно предпросмотра |
-| `tracking` | true | ROI руки из ландмарков прошлого кадра (кость не съезжает) |
-| `clahe` | true | выравнивание контраста (тёмная комната) |
-| `palm_score_threshold` / `landmark_score_threshold` | 0.4 / 0.25 | пороги детекта |
+| `tracking` / `clahe` | true | настройки fallback-бэкенда |
+| `palm_score_threshold` / `landmark_score_threshold` | 0.4 / 0.25 | пороги fallback-детекта |
 
-Активная зона = центральная часть кадра (при сенсе 1.0 — средняя половина по
-ширине и высоте). Палец в центре зоны → курсор в центре экрана; палец в углу
-зоны → курсор в углу экрана. Палец вне зоны — курсор прижат к краю экрана.
+Весь кадр маппится на весь экран (никакой активной зоны); сенса — гейн
+от точки захвата.
 
-## Как это работает (4 слоя)
+## Как это работает
 
-1. **Захват** (`camera.py`) — `CAP_DSHOW` + MJPG + выделенный drain-поток,
-   который непрерывно осушает камеру и отдаёт только свежайший кадр
-   (с номером — цикл не обрабатывает дубликаты). Драйвер DShow держит
-   внутреннюю очередь: без drain-потока из неё читаются устаревшие кадры
-   и копится лаг (те самые 2-3с).
-2. **Детект** (`hands.py`, `tracking.py`) — PINTO-пайплайн как ONNX:
-   palm-детектор с NMS внутри графа (192×192) + landmark-модель
-   (224×224, 21 точка) через `onnxruntime` DirectML на GPU. Архитектура
-   **track-priority**: пока рука в треке, источник — трекуемый ROI
-   (ландмарки прошлого кадра + экстраполяция скорости), palm работает
-   разведчиком (дубликаты игнорирует, перехватывает только ДРУГУЮ руку,
-   лучше на 0.15); разрывы (смаз/резкий свайп) мостятся palm-кандидатом
-   той же руки без сброса фильтров. Кропы ограничены (пер-кадр + окно
-   1.5с + потолок), статичные не-руки (полка, лицо в покое) уходят в
-   карантин. Кадр и кроп прогоняются через CLAHE.
-3. **Кадры → команда** (`pose.py`, `mapping.py`) — палец считается указательным,
-   когда он прямой (tip дальше от запястья, чем PIP, и изгиб в PIP < 50°),
-   а средний/безымянный/мизинец согнуты. Ладонь или кулак — не считаются.
-   Подтверждение 3 кадра подряд (debounce). Позиция кончика (landmark 8)
-   маппится из активной зоны в экран абсолютно + One Euro сглаживание.
-4. **Команда → ПК** (`cursor.py`) — `pynput` (SetCursorPos под капотом),
-   процесс DPI-aware, чтобы координаты совпадали с физическими пикселями.
-
-## Почему удалено всё остальное
-
-Стек v1 (brain-контейнер, FSM жестов, WebSocket, веб-UI) работал, но курсор
-не двигался по причине, которую не удалось локализовать за сутки. v2 — один
-локальный процесс без сети, без контейнеров, без промежуточных слоёв: меньше
-поверхностей — меньше мест, где сломаться. Proven-куски (drain-reader,
-ONNX-декод с фиксами, One Euro) перенесены дословно.
+1. **Захват** (`camera.py`) — `CAP_DSHOW` + MJPG + выделенный drain-поток:
+   камера читается непрерывно, цикл получает только свежайший кадр
+   (очередь драйвера не копит лаг). Мёртвая камера — reopen, затем
+   PnP-рестарт устройства.
+2. **Детект** (`mp_hands.py`) — официальный MediaPipe GestureRecognizer
+   (tasks API, VIDEO-режим): ландмарки 21 точки + натренированные классы
+   жестов. Watchdog в своём потоке раз в секунду перепроверяет кадр
+   независимым IMAGE-распознавателем: если VIDEO-трекер залип на текстуре
+   (волосы, кресло) — трекер пересоздаётся. YuNet-гейт отсекает лицо,
+   статик-лок — замершие галлюцинации. Коастинг 0.35с замораживает скелет
+   на разрывах трекинга (без мигания костей).
+3. **Жесты** (`pose.py`) — всё в долях длины ладони (wrist → middle MCP):
+   щипок = дистанция большой-кончик с гистерезисом (нажатие — сразу на
+   пересечении порога, ноль добавленной задержки); позы (кулак/✌/открытая)
+   — по строгим счётчикам выпрямленных пальцев, классы MediaPipe только
+   подтверждают. Кулак не может кликнуть: щипок требует раскрытой формы
+   руки.
+4. **Скелет** — shape-lock: форма заморожена и жёстко переставляется по
+   фильтрованному запястью/углу/масштабу (кости не дрожат), пересборка
+   при смене позы. Дистанции щипка читаются из живых ландмарков.
+5. **Команда → ПК** (`cursor.py`) — `pynput`, процесс DPI-aware; медиана-3
+   + One Euro; при потере руки/выходе — принудительный отпуск всех кнопок.
 
 ## Models (downloaded into `models/`, gitignored)
 
 | file | source | used by |
 |---|---|---|
-| `yolox_l.onnx` (216MB) | [yzd-v/DWPose](https://huggingface.co/yzd-v/DWPose) | person detector (DWPose backend) |
-| `dw-ll_ucoco_384.onnx` (134MB) | [yzd-v/DWPose](https://huggingface.co/yzd-v/DWPose) | RTMPose wholebody, 133 keypoints (DWPose backend) |
-| `face_detection_yunet_2023mar.onnx` (232KB) | [opencv_zoo](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet) | face gate (legacy backend) |
-| `gesture_recognizer.task` (8.4MB) | [MediaPipe gesture recognizer](https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/latest/gesture_recognizer.task) | **primary backend** (official pipeline + trained gesture classes) |
-| `yolox_l.onnx` / `dw-ll_ucoco_384.onnx` are optional research artifacts (DWPose experiment, unused at runtime) | | |
+| `gesture_recognizer.task` (8.4MB) | [MediaPipe gesture recognizer](https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/latest/gesture_recognizer.task) | **primary backend** |
+| `face_detection_yunet_2023mar.onnx` (232KB) | [opencv_zoo](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection/yunet) | face gate |
 | `palm_detection_full_inf_post_192x192.onnx`, `hand_landmark_sparse_Nx3x224x224.onnx` | [PINTO0309 hand-gesture-recognition](https://github.com/PINTO0309/hand-gesture-recognition-using-onnx) | fallback backend (no mediapipe package) |
-
-The **primary backend is the official MediaPipe gesture recognizer**
-(hand landmarks + trained gesture classes: Closed_Fist / Pointing_Up /
-Victory / Open_Palm). The ONNX palm+landmark pair is the fallback when
-the mediapipe package is missing (not fetched by `make models`).
-DWPose files are unused research artifacts.
+| `yolox_l.onnx` / `dw-ll_ucoco_384.onnx` | [yzd-v/DWPose](https://huggingface.co/yzd-v/DWPose) | unused research artifacts |
 
 ## Fresh clone (new PC)
 

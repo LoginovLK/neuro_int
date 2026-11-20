@@ -1,4 +1,12 @@
-"""neuroint cursor v2 — поднятый указательный палец ведёт курсор. Всё.
+"""neuroint cursor v3 — industry-standard gesture mouse.
+
+Vocabulary (Ultraleap / Vision Pro / camera-mouse convention):
+
+  open hand          -> MOVE   (cursor follows the index knuckle)
+  pinch thumb-index  -> LMB press, release on open (click / hold = drag)
+  pinch thumb-middle -> RMB press, release on open
+  index+middle (V)   -> SCROLL: vertical hand travel = wheel steps
+  fist / bundle      -> REST: cursor frozen, buttons up
 
 Run:  make run        (debug window)
       make headless   (без окна)
@@ -15,7 +23,6 @@ import logging.handlers
 import queue as queue_mod
 import threading
 import time
-from collections import deque
 from pathlib import Path
 
 import cv2
@@ -24,36 +31,41 @@ from pynput.mouse import Button
 from neuroint_cursor.camera import Camera
 from neuroint_cursor.config import Settings
 from neuroint_cursor.cursor import CursorActuator
-from neuroint_cursor.hands import OnnxHands
 from neuroint_cursor.overlay import draw
-from neuroint_cursor.pose import classify, is_zero, pinch_center
+from neuroint_cursor.pose import (
+    INDEX_MCP,
+    is_move_pose,
+    is_rest_pose,
+    is_scroll_pose,
+    pinch_dist,
+    pinch_l_valid,
+    pinch_r_valid,
+)
 
 logger = logging.getLogger("neuroint_cursor")
 
-# official canned gestures -> state-machine classes. The bundle (fist /
-# closed hand) and the нолик share the closed silhouette, so control
-# from Closed_Fist is split by the strict geometric zero check.
-# point3 (three fingers) and any unrecognized pose ("None") fall back
-# to the geometric classify().
-GESTURE_MAP = {
-    "Closed_Fist": "control",
-    "Pointing_Up": "point1",
-    "Victory": "point2",
-    "Open_Palm": "open",
-}
-GESTURE_MIN_SCORE = 0.55
+# canned-class score for pose CONFIRMATION only (Closed_Fist / Victory /
+# Open_Palm are tilt-stable hints; clicks never come from classes)
+OFFICIAL_CONFIRM = 0.5
+# consecutive rest frames before a held button counts as dropped (a pose
+# transition flickers 1-2 frames; five frames means a real fist)
+REST_DROP_FRAMES = 5
+# consecutive frames to enter/leave the scroll pose
+SCROLL_FRAMES = 3
+# a held button survives hand-tracking gaps up to this long (MediaPipe
+# drops 1-3 frames of tracking under blur; a real hand-out releases here)
+BUTTON_GRACE_S = 0.30
+PINCH_EMA = 0.5
 
 MODELS = Path(__file__).resolve().parents[2] / "models"
 PALM_MODEL = MODELS / "palm_detection_full_inf_post_192x192.onnx"
 LANDMARK_MODEL = MODELS / "hand_landmark_sparse_Nx3x224x224.onnx"
 FACE_MODEL = MODELS / "face_detection_yunet_2023mar.onnx"
 MP_MODEL = MODELS / "gesture_recognizer.task"
-DWPOSE_DET = MODELS / "yolox_l.onnx"
-DWPOSE_POSE = MODELS / "dw-ll_ucoco_384.onnx"
 
 
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="index-finger pointing -> cursor")
+    ap = argparse.ArgumentParser(description="gesture mouse: open hand + pinch")
     ap.add_argument("--no-window", action="store_true", help="no debug window")
     ap.add_argument("--dry", action="store_true", help="log cursor target instead of moving")
     ap.add_argument("--smoke", type=float, default=0.0, help="run N seconds, print stats, exit")
@@ -96,15 +108,15 @@ def main() -> int:
 
     cam = Camera(cfg.camera_index, cfg.width, cfg.height, cfg.fps, cfg.mirror)
     try:
-        # OFFICIAL MediaPipe hand landmarker (Google's own palm-detect ->
-        # landmark-track pipeline, preprocessing matched to training).
-        # The manually ported ONNX models produced cramped, twitchy
-        # skeletons; this is the reference quality Lev's original v1 had.
+        # OFFICIAL MediaPipe gesture recognizer (Google's own pipeline;
+        # the manually ported ONNX models produced cramped skeletons)
         from neuroint_cursor.mp_hands import MediaPipeHands
 
-        hands = MediaPipeHands(MP_MODEL, face_model=FACE_MODEL)  # type: ignore[assignment]
-        logger.info("backend: mediapipe hand landmarker (official)")
+        hands = MediaPipeHands(MP_MODEL, face_model=FACE_MODEL)
+        logger.info("backend: mediapipe gesture recognizer (official)")
     except ImportError:
+        from neuroint_cursor.hands import OnnxHands
+
         hands = OnnxHands(
             PALM_MODEL,
             LANDMARK_MODEL,
@@ -115,12 +127,10 @@ def main() -> int:
             face_model=FACE_MODEL,
         )
         logger.info("backend: palm-first onnx (mediapipe package not installed)")
-    act = CursorActuator(cfg.sensitivity, cfg.min_cutoff, cfg.beta)
-    logger.info(
-        "screen %dx%d  full-frame mapping",
-        act.screen_w,
-        act.screen_h,
+    act = CursorActuator(
+        cfg.sensitivity, cfg.min_cutoff, cfg.beta, actuate=not args.dry
     )
+    logger.info("screen %dx%d  full-frame mapping", act.screen_w, act.screen_h)
 
     win = "neuroint cursor"
     if cfg.debug_window and not args.smoke:
@@ -132,19 +142,35 @@ def main() -> int:
     show_window = win is not None
     deadline = time.monotonic() + args.smoke if args.smoke else None
 
-    frames = detected = pointing_frames = moved = 0
-    active = False
-    on_counter = off_counter = 0
-    zero_fired = False
-    cls_win: deque[str] = deque(maxlen=8)
-    prev_stable: str | None = None
-    last_click_t = 0.0
+    frames = detected = engaged_frames = moved = 0
+    engaged = False
+    move_run = 0          # consecutive MOVE-pose frames (engage debounce)
+    idle_run = 0          # consecutive REST/no-hand frames (disengage)
+    scroll_run = 0        # consecutive SCROLL-pose frames
+    scroll_active = False
+    rest_run = 0          # consecutive REST frames (button drop)
+    lmb_down = rmb_down = False
+    last_fresh_t = time.monotonic()
+    d_li_ema: float | None = None
+    d_lm_ema: float | None = None
+    scroll_y_ema: float | None = None
+    status = "open hand to engage  |  fist = rest"
     fps_t = time.monotonic()
     fps_frames = 0
     fps = 0.0
     last_seq = -1
     canvas = None
     exit_code = 0
+
+    def _release_buttons() -> None:
+        nonlocal lmb_down, rmb_down
+        if lmb_down:
+            act.release(Button.left)
+            logger.info("gesture: LMB up")
+        if rmb_down:
+            act.release(Button.right)
+            logger.info("gesture: RMB up")
+        lmb_down = rmb_down = False
 
     try:
         while True:
@@ -161,102 +187,126 @@ def main() -> int:
                 last_seq = seq
                 now = time.monotonic()
 
-                results = hands.detect(frame, prefer_pinch=active)
+                results = hands.detect(frame, prefer_pinch=engaged)
                 result = results[0] if results else None
                 # coast keeps the skeleton visible but is NOT a hand:
-                # control treats stale results as "no hand". The window
-                # must cover MediaPipe's own 1-3 frame re-detection gaps
-                # (measured ~100ms) or the cursor freezes every few
-                # seconds; a real hand-out still releases via the
-                # off-debounce right after.
-                fresh = (now - getattr(hands, "_last_fresh", now)) <= 0.15
+                # decisions need fresh detections. The window covers
+                # MediaPipe's own 1-3 frame re-detection gaps (~100ms).
+                # The ONNX backend has no _last_fresh: a returned hand IS
+                # a fresh detection there.
+                lf = getattr(hands, "_last_fresh", None)
+                fresh = (now - lf) <= 0.15 if lf is not None else result is not None
+                if fresh:
+                    # the button grace counts from the last REAL detection,
+                    # not from a coasting (stale) skeleton
+                    last_fresh_t = now
 
-                # gesture classification (fresh results only). Primary
-                # source: Google's trained canned-gesture classifier
-                # (stable under hand tilt, unlike 2D projection rules);
-                # geometric classify() only for poses it does not cover.
-                state = "none"
+                # ---- pose (fresh frames only) ----
+                pose = "none"
+                raw = getattr(hands, "last_raw", None)
                 if fresh and result is not None:
+                    if raw is None:
+                        raw = result[0]
                     gname, gscore = getattr(hands, "last_gesture", (None, 0.0))
-                    official = (
-                        GESTURE_MAP.get(gname)
-                        if gscore >= GESTURE_MIN_SCORE
-                        else None
-                    )
-                    if official == "control":
-                        state = "zero" if is_zero(result[0]) else "control"
-                    elif official:
-                        state = official
+                    official = gscore >= OFFICIAL_CONFIRM
+                    if is_scroll_pose(raw) or (official and gname == "Victory"):
+                        pose = "scroll"
+                    elif is_move_pose(raw) or (
+                        official and gname in ("Open_Palm", "Pointing_Up")
+                    ):
+                        pose = "move"
+                    elif is_rest_pose(raw) or (official and gname == "Closed_Fist"):
+                        pose = "rest"
+                    elif engaged:
+                        pose = "move"  # ambiguous cloud: keep driving
                     else:
-                        state = classify(result[0])
-                        # phantom-click kill (measured on Lev's frames):
-                        # 2D projection miscounts fingers on tilted or
-                        # garbage clouds (his open palm read point2, a
-                        # gun grip read point2). CLICKS come only from
-                        # the trained classes; the fallback serves
-                        # motion / scroll / zero / release.
-                        if state in ("point1", "point2"):
-                            state = "control"
-                cls_win.append(state)
-                stable = state if (
-                    len(cls_win) >= 3
-                    and cls_win[-1] == cls_win[-2] == cls_win[-3]
-                ) else None
+                        pose = "none"
 
-                pointing = stable == "control"
-                zero = stable == "zero"
+                move_run = move_run + 1 if pose == "move" else 0
+                idle_run = idle_run + 1 if pose in ("rest", "none") else 0
+                rest_run = rest_run + 1 if pose == "rest" else 0
 
-                # Debounce both edges: ON after a few bundle frames,
-                # OFF only after a grace period (single dropped detections
-                # must not stutter the cursor).
-                on_counter = on_counter + 1 if pointing else 0
-                off_counter = off_counter + 1 if not pointing else 0
-                if not active and on_counter >= cfg.debounce_frames:
-                    active = True
-                    bx, by = pinch_center(result[0])  # hand's zero point
-                    act.reset(bx, by)
-                elif active and off_counter >= cfg.debounce_off_frames:
-                    active = False
+                # ---- engage / disengage ----
+                if (
+                    not engaged
+                    and result is not None
+                    and move_run >= cfg.debounce_frames
+                ):
+                    engaged = True
+                    act.reset(result[0][INDEX_MCP][0], result[0][INDEX_MCP][1])
+                    logger.info("engaged")
+                elif engaged and idle_run >= cfg.debounce_off_frames:
+                    engaged = False
+                    _release_buttons()
+                    act.scroll_end()
+                    scroll_active = False
+                    logger.info("released")
 
-                # zero gesture: park the cursor in the screen center once
-                # per gesture (edge-triggered)
-                if zero and not zero_fired:
-                    act.center()
-                    zero_fired = True
-                    active = False
-                    on_counter = 0
-                    logger.info("zero gesture: cursor centered")
-                if not zero:
-                    zero_fired = False
+                # ---- held buttons ----
+                if fresh and result is not None:
+                    d_li = pinch_dist(raw, "index")
+                    d_lm = pinch_dist(raw, "middle")
+                    d_li_ema = d_li if d_li_ema is None else (
+                        PINCH_EMA * d_li + (1 - PINCH_EMA) * d_li_ema
+                    )
+                    d_lm_ema = d_lm if d_lm_ema is None else (
+                        PINCH_EMA * d_lm + (1 - PINCH_EMA) * d_lm_ema
+                    )
+                    if (
+                        engaged
+                        and not scroll_active
+                        and not lmb_down
+                        and not rmb_down
+                    ):
+                        # press fires on the threshold crossing: zero added
+                        # latency (the Jota CHI'13 direct-manipulation rule)
+                        if pinch_l_valid(raw, cfg.pinch_close):
+                            act.press(Button.left)
+                            lmb_down = True
+                            logger.info("gesture: LMB down (pinch index)")
+                        elif pinch_r_valid(raw, cfg.pinch_close, cfg.pinch_open):
+                            act.press(Button.right)
+                            rmb_down = True
+                            logger.info("gesture: RMB down (pinch middle)")
+                    if lmb_down and (d_li_ema > cfg.pinch_open or rest_run >= REST_DROP_FRAMES):
+                        act.release(Button.left)
+                        lmb_down = False
+                        logger.info("gesture: LMB up")
+                    if rmb_down and (d_lm_ema > cfg.pinch_open or rest_run >= REST_DROP_FRAMES):
+                        act.release(Button.right)
+                        rmb_down = False
+                        logger.info("gesture: RMB up")
+                elif now - last_fresh_t > BUTTON_GRACE_S:
+                    _release_buttons()  # hand really gone: never leave a stuck button
 
-                # finger-count commands: STRICT edge-trigger — a click fires
-                # only on the transition CONTROL -> point-N (show fingers
-                # from the closed hand). An open palm never clicks, and a
-                # 0.5s cooldown blocks accidental double-fires.
-                if stable != "point3":
-                    act.stop_scroll()
-                from_ctrl = prev_stable == "control" or prev_stable == "none"
-                now_s_c = time.monotonic()
-                if now_s_c - last_click_t < 0.5:
-                    from_ctrl = False
-                if stable == "point1" and from_ctrl:
-                    act.click(Button.left)
-                    last_click_t = now_s_c
-                    logger.info("gesture: left click")
-                elif stable == "point2" and from_ctrl:
-                    act.click(Button.right)
-                    last_click_t = now_s_c
-                    logger.info("gesture: right click")
-                elif stable == "point3" and from_ctrl:
-                    act.start_scroll(pinch_center(result[0])[1])
-                    last_click_t = now_s_c
-                    logger.info("gesture: wheel grab")
-                elif stable == "point3":
-                    act.scroll_by(pinch_center(result[0])[1])
-                prev_stable = stable
+                # ---- scroll ----
+                scroll_run = scroll_run + 1 if pose == "scroll" else 0
+                if (
+                    engaged
+                    and not lmb_down
+                    and not rmb_down
+                    and scroll_run >= SCROLL_FRAMES
+                ):
+                    if not scroll_active:
+                        scroll_active = True
+                        scroll_y_ema = raw[INDEX_MCP][1]
+                        act.scroll_anchor(scroll_y_ema)
+                        logger.info("gesture: scroll mode")
+                elif scroll_active and scroll_run == 0:
+                    scroll_active = False
+                    scroll_y_ema = None
+                    act.scroll_end()
+                    logger.info("gesture: scroll end")
+                if scroll_active and fresh and result is not None:
+                    y = raw[INDEX_MCP][1]
+                    scroll_y_ema = (
+                        0.7 * scroll_y_ema + 0.3 * y if scroll_y_ema is not None else y
+                    )
+                    act.scroll_feed(scroll_y_ema)
 
-                if active and result is not None:
-                    fx, fy = pinch_center(result[0])  # the bundle center
+                # ---- cursor movement (drag = pinch held + move) ----
+                if engaged and result is not None and not scroll_active:
+                    fx, fy = result[0][INDEX_MCP][0], result[0][INDEX_MCP][1]
                     if args.dry:
                         moved += 1
                         if moved % 15 == 1:
@@ -266,19 +316,33 @@ def main() -> int:
                         act.move(fx, fy, now)
                         moved += 1
 
+                if lmb_down:
+                    status = "LMB (pinch index) - hold & move = drag"
+                elif rmb_down:
+                    status = "RMB (pinch middle)"
+                elif scroll_active:
+                    status = "SCROLL - two fingers, move hand up/down"
+                elif engaged:
+                    status = "MOVE - open hand  |  pinch = click  |  fist = rest"
+                else:
+                    status = "open hand to engage  |  fist = rest"
+
                 frames += 1
                 detected += 1 if result is not None else 0
-                pointing_frames += 1 if pointing else 0
+                engaged_frames += 1 if engaged else 0
                 fps_frames += 1
                 if now - fps_t >= 1.0:
                     fps = fps_frames / (now - fps_t)
                     fps_frames = 0
                     fps_t = now
                     logger.info(
-                        "fps %.1f  hands %s  pointing %s  sens %.1f",
+                        "fps %.1f  hands %s  engaged %s  lmb %s  rmb %s  scroll %s  sens %.1f",
                         fps,
                         bool(result),
-                        active,
+                        engaged,
+                        lmb_down,
+                        rmb_down,
+                        scroll_active,
                         act.sensitivity,
                     )
 
@@ -288,7 +352,11 @@ def main() -> int:
                         result,
                         fps,
                         act.sensitivity,
-                        active,
+                        status,
+                        active=engaged,
+                        lmb=lmb_down,
+                        rmb=rmb_down,
+                        scroll=scroll_active,
                     )
 
             if show_window and canvas is not None:
@@ -312,6 +380,8 @@ def main() -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        _release_buttons()
+        act.release_all()
         cam.close()
         listener.stop()
         if win is not None:
@@ -323,7 +393,7 @@ def main() -> int:
                 {
                     "frames": frames,
                     "detected": detected,
-                    "pointing_frames": pointing_frames,
+                    "engaged_frames": engaged_frames,
                     "would_move_or_moved": moved,
                     "fps_avg": round(fps, 1),
                 }

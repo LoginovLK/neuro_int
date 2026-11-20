@@ -60,15 +60,6 @@ from neuroint_cursor.tracking import (
 
 logger = logging.getLogger(__name__)
 
-HAND_CONNECTIONS = [
-    (0, 1), (1, 2), (2, 3), (3, 4),
-    (0, 5), (5, 6), (6, 7), (7, 8),
-    (5, 9), (9, 10), (10, 11), (11, 12),
-    (9, 13), (13, 14), (14, 15), (15, 16),
-    (13, 17), (17, 18), (18, 19), (19, 20),
-    (0, 17),
-]
-
 # Bonus for a pinch candidate when CHOOSING among several acquisition
 # candidates: the bundle hand must win over a junk anchor at equal scores.
 PINCH_BONUS = 0.15
