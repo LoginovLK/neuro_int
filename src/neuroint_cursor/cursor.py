@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sys
 from collections import deque
+from math import hypot
 from statistics import median
 
 from pynput.mouse import Button, Controller
@@ -17,6 +18,22 @@ from neuroint_cursor.smoothing import PointFilter2D
 
 MIN_SENS = 0.5
 MAX_SENS = 8.0
+
+# Pointer acceleration (the OS-mouse answer to the precision-vs-speed
+# dilemma). The speed signal is the EMA of the SIGNED velocity vector:
+# physiological tremor is oscillatory (its vector average collapses to
+# ~0) while a deliberate slow aim is persistent (full magnitude) — so
+# the curve can suppress tremor hard without suppressing aim. Speeds
+# are in base-gain screen px/s.
+G_MIN = 0.05
+S_LOW = 150.0
+S_HIGH = 600.0
+ACCEL_CAP = 3.0
+VEL_EMA = 0.25
+# movement pauses longer than this (scroll mode, tracking gap) rebase the
+# reference instead of integrating the whole travel in one frame (the
+# acceleration curve would boost that leap up to ACCEL_CAP)
+REBASE_GAP_S = 0.2
 
 
 def make_dpi_aware() -> None:
@@ -44,12 +61,12 @@ def screen_size() -> tuple[int, int]:
 
 
 class CursorActuator:
-    """Relative (touchpad-style) control.
+    """Relative (touchpad-style) control with pointer acceleration.
 
-    On engage (reset with the control-point anchor) the cursor STAYS
-    where it is; afterwards the hand DELTA from the engage anchor drives
-    the cursor from that spot, scaled by sensitivity - no jump to
-    wherever the hand happens to be.
+    On engage the cursor STAYS where it is; afterwards each frame's hand
+    increment moves the cursor from its current spot, scaled by
+    sensitivity times the acceleration curve: a still hand freezes the
+    cursor on target (tremor suppressed), a flick sweeps the screen.
     """
 
     def __init__(
@@ -70,8 +87,11 @@ class CursorActuator:
         # median-of-3 on the filtered target: kills single-frame outliers
         # (the residual finger twitch amplified by the sensitivity gain)
         self._median_win: deque[tuple[int, int]] = deque(maxlen=3)
-        self._anchor_frame: tuple[float, float] | None = None
-        self._anchor_cursor: tuple[int, int] | None = None
+        # incremental (pointer-acceleration) mode state
+        self._anchor_cursor: tuple[float, float] | None = None
+        self._prev_f: tuple[float, float] | None = None
+        self._prev_t: float | None = None
+        self._vel_ema: tuple[float, float] = (0.0, 0.0)
         self._scroll_ref: float | None = None
         self._scroll_acc = 0.0
 
@@ -84,23 +104,55 @@ class CursorActuator:
 
     def reset(self, anchor_fx: float, anchor_fy: float) -> None:
         """Engage: freeze the cursor at its current spot and bind the
-        current control-point position as the hand's zero point."""
+        current control-point position as the movement reference."""
         self._filter.reset()
         self._median_win.clear()
-        self._anchor_frame = (anchor_fx, anchor_fy)
+        self._prev_f = (anchor_fx, anchor_fy)
+        self._prev_t = None
+        self._vel_ema = (0.0, 0.0)
         pos = self._mouse.position
-        self._anchor_cursor = (int(pos[0]), int(pos[1]))
+        self._anchor_cursor = (float(pos[0]), float(pos[1]))
+
+    def _gain_mult(self, speed: float) -> float:
+        """Acceleration curve: steep suppression below S_LOW (a still
+        hand freezes on target), 1:1 through the aiming band, boosted up
+        to ACCEL_CAP on flicks."""
+        if speed < S_LOW:
+            return max(G_MIN, (speed / S_LOW) ** 1.5)
+        if speed < S_HIGH:
+            return 1.0
+        return min(1.0 + (speed - S_HIGH) / S_HIGH, ACCEL_CAP)
 
     def move(self, fx: float, fy: float, now_s: float) -> tuple[int, int]:
-        if self._anchor_frame is None or self._anchor_cursor is None:
+        if self._anchor_cursor is None or self._prev_f is None:
             pos = self._mouse.position
             return int(pos[0]), int(pos[1])
-        dx = (fx - self._anchor_frame[0]) * self.screen_w * self._sensitivity
-        dy = (fy - self._anchor_frame[1]) * self.screen_h * self._sensitivity
-        sx = min(max(self._anchor_cursor[0] + dx, 0), self.screen_w - 1)
-        sy = min(max(self._anchor_cursor[1] + dy, 0), self.screen_h - 1)
+        dt = 1.0 / 30.0
+        rebase = self._prev_t is not None and (now_s - self._prev_t) > REBASE_GAP_S
+        if self._prev_t is not None and not rebase:
+            dt = max(now_s - self._prev_t, 1.0 / 120.0)
+        self._prev_t = now_s
+        # per-frame hand increment at base gain (screen px)
+        if rebase:
+            inc_x = inc_y = 0.0
+            self._vel_ema = (0.0, 0.0)
+        else:
+            inc_x = (fx - self._prev_f[0]) * self.screen_w * self._sensitivity
+            inc_y = (fy - self._prev_f[1]) * self.screen_h * self._sensitivity
+        self._prev_f = (fx, fy)
+        # signed-velocity EMA: tremor oscillates (averages out), a
+        # deliberate aim is persistent (full magnitude)
+        vx, vy = inc_x / dt, inc_y / dt
+        self._vel_ema = (
+            VEL_EMA * vx + (1.0 - VEL_EMA) * self._vel_ema[0],
+            VEL_EMA * vy + (1.0 - VEL_EMA) * self._vel_ema[1],
+        )
+        g = self._gain_mult(hypot(*self._vel_ema))
+        cx = min(max(self._anchor_cursor[0] + inc_x * g, 0), self.screen_w - 1)
+        cy = min(max(self._anchor_cursor[1] + inc_y * g, 0), self.screen_h - 1)
+        self._anchor_cursor = (cx, cy)
         # One Euro + median-of-3: smooth without losing fast strokes
-        sx, sy = self._filter.filter(sx, sy, now_s)
+        sx, sy = self._filter.filter(cx, cy, now_s)
         self._median_win.append((int(sx), int(sy)))
         mx = int(median(p[0] for p in self._median_win))
         my = int(median(p[1] for p in self._median_win))
