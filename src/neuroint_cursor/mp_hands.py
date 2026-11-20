@@ -52,8 +52,9 @@ TIPS_REFIT = 0.40
 TIPS = (8, 12, 16, 20)
 # coast: when tracking drops (fast swipe, blur) keep the last skeleton
 # FROZEN in place instead of blinking off and re-drawing at the new spot.
-# Absolute deadline: _last_fresh only moves on REAL detections.
-COAST_SECONDS = 0.35
+# Absolute deadline: _last_fresh only moves on REAL detections. Short —
+# a long freeze reads as "bones stuck, then teleport" on fast sweeps.
+COAST_SECONDS = 0.20
 
 
 class MediaPipeHands:
@@ -104,7 +105,6 @@ class MediaPipeHands:
             [],
         )
 
-        self._filters: list[PointFilter2D] | None = None
         self._shape: tuple[list[tuple[float, float]], float] | None = None
         self._anchor_f: PointFilter2D | None = None
         self._ang_vec: tuple[float, float] | None = None
@@ -259,19 +259,6 @@ class MediaPipeHands:
             )
         return [(ex / image_w, ey / image_h) for ex, ey in emitted]
 
-    def _smooth(
-        self, raw_points: list[tuple[float, float]], now_s: float
-    ) -> list[tuple[float, float]]:
-        if self._filters is None:
-            self._filters = [PointFilter2D(min_cutoff=1.0, beta=0.02) for _ in range(21)]
-        return [
-            (float(sx), float(sy))
-            for sx, sy in (
-                self._filters[i].filter(x, y, now_s)
-                for i, (x, y) in enumerate(raw_points)
-            )
-        ]
-
     # ---------------- public ----------------
 
     def detect(
@@ -311,7 +298,6 @@ class MediaPipeHands:
             self._shape = None
             self._anchor_f = None
             self._ang_vec = None
-            self._filters = None
             self._sel_wrist = None
             self.last_raw = None
             return []
@@ -369,7 +355,6 @@ class MediaPipeHands:
             self._shape = None
             self._anchor_f = None
             self._ang_vec = None
-            self._filters = None
             self._sel_wrist = None
             self.last_raw = None
             return []
@@ -408,7 +393,12 @@ class MediaPipeHands:
             shaped = self._shape_apply(
                 pts21, now_s, image_w, image_h, force_refit=True
             )
-        points = self._smooth(shaped, now_s)
+        # NO per-landmark filter on top of the shape lock: that third
+        # layer (anchor One Euro -> shape lock -> per-landmark One Euro)
+        # had a group delay that made the bones trail a fast hand and
+        # the cursor read as laggy; the shape lock's filtered anchor is
+        # the smoothing, and the cursor reads the RAW control point.
+        points = shaped
 
         self._coast = (points, handed, score)
         self._last_fresh = now_s

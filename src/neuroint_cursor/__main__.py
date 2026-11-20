@@ -252,7 +252,10 @@ def main() -> int:
                     and move_run >= cfg.debounce_frames
                 ):
                     engaged = True
-                    act.reset(result[0][INDEX_MCP][0], result[0][INDEX_MCP][1])
+                    # same source as the movement control point below —
+                    # a shaped-vs-raw mismatch here would hop the cursor
+                    anchor_pts = raw if raw is not None else result[0]
+                    act.reset(anchor_pts[INDEX_MCP][0], anchor_pts[INDEX_MCP][1])
                     logger.info("engaged")
                 elif engaged and idle_run >= cfg.debounce_off_frames:
                     engaged = False
@@ -369,8 +372,13 @@ def main() -> int:
                     act.scroll_feed(scroll_y_ema)
 
                 # ---- cursor movement (drag = pinch held + move) ----
+                # the control point reads the RAW landmarks (like the
+                # gesture distances): the shape-locked skeleton is for
+                # drawing — its re-anchoring lags a fast hand, and a
+                # laggy control point reads as the cursor trailing
                 if engaged and result is not None and not scroll_active:
-                    fx, fy = result[0][INDEX_MCP][0], result[0][INDEX_MCP][1]
+                    ctrl = raw if raw is not None else result[0]
+                    fx, fy = ctrl[INDEX_MCP][0], ctrl[INDEX_MCP][1]
                     if args.dry:
                         moved += 1
                         if moved % 15 == 1:
