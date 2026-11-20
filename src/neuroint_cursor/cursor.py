@@ -34,6 +34,17 @@ VEL_EMA = 0.25
 # reference instead of integrating the whole travel in one frame (the
 # acceleration curve would boost that leap up to ACCEL_CAP)
 REBASE_GAP_S = 0.2
+# single-frame outlier gate: a hand jump beyond this fraction of the
+# frame in ONE frame (~6 frame-widths/s) is a detector glitch (tracking
+# re-acquire, hand ID switch), not human motion — the frame is skipped
+# and the cursor HOLDS. Incremental movement has no absolute anchor to
+# pull the cursor back, so an integrated outlier would teleport it.
+OUTLIER_N = 0.20
+# hard cap on the cursor step after gain, as a fraction of the screen
+# width per frame (~9000 px/s on a 2560 screen): real flicks stay under
+# it, anything above slides instead of teleporting (glitches are already
+# gated to zero by OUTLIER_N; this is the last-resort bound)
+MAX_STEP_FRAC = 0.11
 
 
 def make_dpi_aware() -> None:
@@ -84,6 +95,7 @@ class CursorActuator:
         self._actuate = actuate
         self._filter = PointFilter2D(min_cutoff=min_cutoff, beta=beta)
         self._mouse = Controller()
+        self._max_step_px = MAX_STEP_FRAC * self.screen_w
         # median-of-3 on the filtered target: kills single-frame outliers
         # (the residual finger twitch amplified by the sensitivity gain)
         self._median_win: deque[tuple[int, int]] = deque(maxlen=3)
@@ -137,8 +149,15 @@ class CursorActuator:
             inc_x = inc_y = 0.0
             self._vel_ema = (0.0, 0.0)
         else:
-            inc_x = (fx - self._prev_f[0]) * self.screen_w * self._sensitivity
-            inc_y = (fy - self._prev_f[1]) * self.screen_h * self._sensitivity
+            jump_n = hypot(fx - self._prev_f[0], fy - self._prev_f[1])
+            if jump_n > OUTLIER_N:
+                # detector glitch (not human motion): hold the cursor,
+                # follow the reference so the next frame is incremental
+                self._vel_ema = (0.0, 0.0)
+                inc_x = inc_y = 0.0
+            else:
+                inc_x = (fx - self._prev_f[0]) * self.screen_w * self._sensitivity
+                inc_y = (fy - self._prev_f[1]) * self.screen_h * self._sensitivity
         self._prev_f = (fx, fy)
         # signed-velocity EMA: tremor oscillates (averages out), a
         # deliberate aim is persistent (full magnitude)
@@ -148,8 +167,13 @@ class CursorActuator:
             VEL_EMA * vy + (1.0 - VEL_EMA) * self._vel_ema[1],
         )
         g = self._gain_mult(hypot(*self._vel_ema))
-        cx = min(max(self._anchor_cursor[0] + inc_x * g, 0), self.screen_w - 1)
-        cy = min(max(self._anchor_cursor[1] + inc_y * g, 0), self.screen_h - 1)
+        step_x, step_y = inc_x * g, inc_y * g
+        mag = hypot(step_x, step_y)
+        if mag > self._max_step_px:
+            scale = self._max_step_px / mag
+            step_x, step_y = step_x * scale, step_y * scale
+        cx = min(max(self._anchor_cursor[0] + step_x, 0), self.screen_w - 1)
+        cy = min(max(self._anchor_cursor[1] + step_y, 0), self.screen_h - 1)
         self._anchor_cursor = (cx, cy)
         # One Euro + median-of-3: smooth without losing fast strokes
         sx, sy = self._filter.filter(cx, cy, now_s)
