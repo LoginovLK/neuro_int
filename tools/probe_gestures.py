@@ -17,7 +17,6 @@ from neuroint_cursor.pose import (  # noqa: E402
     is_scroll_pose,
     pinch_dist,
     pinch_l_valid,
-    pinch_r_valid,
     thumb_pip_dist,
 )
 
@@ -56,6 +55,5 @@ for name in names:
         f"d_thumb_index={pinch_dist(pts, 'index'):.2f} "
         f"d_thumb_pip={thumb_pip_dist(pts):.2f} "
         f"d_thumb_middle={pinch_dist(pts, 'middle'):.2f} "
-        f"lmb={pinch_l_valid(pts, CLOSE)} "
-        f"rmb={pinch_r_valid(pts, CLOSE)}"
+        f"lmb={pinch_l_valid(pts, CLOSE)}"
     )

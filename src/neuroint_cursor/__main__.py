@@ -5,12 +5,16 @@ NO rest pose; shape flicker can never freeze the cursor):
 
   any hand in frame  -> MOVE   (cursor follows the index knuckle)
   pinch thumb-index  -> LMB press, release on open (click / hold = drag)
-  pinch thumb-middle -> RMB press, release on open
   index+middle (V)   -> SCROLL: vertical hand travel = wheel steps
   fist / bundle      -> cannot START a click (the d46 guard gates the
                         press); a click already held lives until the
                         pinch opens or the hand leaves the frame
   hand out of frame  -> release everything, cursor frozen
+
+  RMB pinch gesture REMOVED (live 2026-11-22: this hand's bundle runs
+  d412 < d48, so every dominance gate fired false RMBs inside bundles —
+  15/15 events were accidents). Vision Pro ships without a pinch-RMB
+  for the same reason: one pinch primitive only.
 
 Run:  make run        (debug window)
       make headless   (без окна)
@@ -27,6 +31,7 @@ import logging.handlers
 import queue as queue_mod
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -38,11 +43,10 @@ from neuroint_cursor.cursor import CursorActuator
 from neuroint_cursor.overlay import draw
 from neuroint_cursor.pose import (
     INDEX_MCP,
-    RMB_DOMINANCE,
     is_scroll_pose,
+    palm_length,
     pinch_dist,
-    pinch_l_valid,
-    pinch_r_valid,
+    pinch_l_fire,
     thumb_pip_dist,
 )
 
@@ -72,6 +76,21 @@ PRESS_REFRACTORY_S = 0.15
 # a press shorter than this stretches to it, so the OS always sees a
 # real click instead of a sub-frame blip
 MIN_HOLD_S = 0.08
+# no press within this window after engage: the hand often enters the
+# frame already half-closed (measured: a false LMB 22ms after engage)
+ENGAGE_GRACE_S = 0.30
+# palm-length EMA for distance normalization: the per-frame projected
+# palm collapses 2-4x when the hand turns edge-on (measured d46 swinging
+# 0.24 -> 2.85 within a second), dragging every threshold along; a slow
+# denominator keeps the units stable for the lifetime of a gesture
+PALM_EMA = 0.1
+
+
+def _med3(buf: deque) -> float:
+    """Median of the last three samples — one-frame landmark spikes
+    (d48 jumping 0.24 -> 0.80 -> 0.24, measured live) collapse before
+    any threshold sees them, at +2 frames of latency (66ms, imperceptible)."""
+    return sorted(buf)[len(buf) // 2]
 
 MODELS = Path(__file__).resolve().parents[2] / "models"
 PALM_MODEL = MODELS / "palm_detection_full_inf_post_192x192.onnx"
@@ -165,17 +184,22 @@ def main() -> int:
     scroll_run = 0        # consecutive SCROLL-pose frames
     scroll_off_run = 0    # consecutive non-scroll frames (scroll exit debounce)
     scroll_active = False
-    lmb_down = rmb_down = False
+    lmb_down = False
     # edge-trigger arming: a pinch press only fires when the pinch had
     # fully OPENED first — chatter inside the hysteresis band cannot
     # re-fire, so one pinch is always exactly one click
-    armed_l = armed_r = False
-    lmb_pressed_at = rmb_pressed_at = 0.0
+    armed_l = False
+    lmb_pressed_at = 0.0
+    engaged_at = 0.0
     last_press_t = 0.0
     last_fresh_t = time.monotonic()
     d_li_ema: float | None = None
-    d_lm_ema: float | None = None
     scroll_y_ema: float | None = None
+    # median-3 windows over the raw pinch distances (see _med3)
+    d48_buf: deque = deque(maxlen=3)
+    d46_buf: deque = deque(maxlen=3)
+    d412_buf: deque = deque(maxlen=3)
+    palm_ema: float | None = None
     # per-second pinch telemetry (threshold tuning from live logs)
     win_d48 = win_d46 = win_d412 = 9.9
     win_presses = 0
@@ -188,14 +212,11 @@ def main() -> int:
     exit_code = 0
 
     def _release_buttons() -> None:
-        nonlocal lmb_down, rmb_down
+        nonlocal lmb_down
         if lmb_down:
             act.release(Button.left)
             logger.info("gesture: LMB up")
-        if rmb_down:
-            act.release(Button.right)
-            logger.info("gesture: RMB up")
-        lmb_down = rmb_down = False
+        lmb_down = False
 
     try:
         while True:
@@ -206,7 +227,7 @@ def main() -> int:
             # Drop held buttons on a stale freshness clock instead; a live
             # camera keeps last_fresh_t fresh (or has no buttons held).
             if (
-                (lmb_down or rmb_down)
+                lmb_down
                 and time.monotonic() - last_fresh_t > BUTTON_GRACE_S + 0.5
             ):
                 _release_buttons()
@@ -262,6 +283,17 @@ def main() -> int:
                     and move_run >= cfg.debounce_frames
                 ):
                     engaged = True
+                    engaged_at = now
+                    # fresh gesture state on every (re)entry: the hand may
+                    # return at a different distance — a stale palm EMA
+                    # would mis-scale every distance for ~1s and a stale
+                    # armed_l could fire a phantom click on the entry pose
+                    palm_ema = None
+                    d48_buf.clear()
+                    d412_buf.clear()
+                    d46_buf.clear()
+                    armed_l = False
+                    d_li_ema = None
                     # same source as the movement control point below —
                     # a shaped-vs-raw mismatch here would hop the cursor
                     anchor_pts = raw if raw is not None else result[0]
@@ -274,35 +306,46 @@ def main() -> int:
                     scroll_active = False
                     logger.info("released")
 
-                # ---- held buttons ----
+                # ---- held buttons (LMB only; the RMB gesture is removed) ----
                 if fresh and result is not None:
-                    d_li = pinch_dist(raw, "index")
-                    d_lm = pinch_dist(raw, "middle")
-                    d46 = thumb_pip_dist(raw)
+                    # slow denominator first: distances normalized by the
+                    # EMA palm length stay in stable units while the hand
+                    # rotates (the per-frame projected palm collapses 2-4x
+                    # edge-on and used to drag every threshold along)
+                    hand_len = palm_length(raw)
+                    if hand_len > 1e-6:
+                        palm_ema = (
+                            hand_len
+                            if palm_ema is None
+                            else (1.0 - PALM_EMA) * palm_ema + PALM_EMA * hand_len
+                        )
+                    d48_buf.append(pinch_dist(raw, "index", palm_ema))
+                    d412_buf.append(pinch_dist(raw, "middle", palm_ema))
+                    d46_buf.append(thumb_pip_dist(raw, palm_ema))
+                    d_li = _med3(d48_buf)
+                    d_lm = _med3(d412_buf)
+                    d46 = _med3(d46_buf)
                     win_d48 = min(win_d48, d_li)
                     win_d46 = min(win_d46, d46)
                     win_d412 = min(win_d412, d_lm)
                     d_li_ema = d_li if d_li_ema is None else (
                         PINCH_EMA * d_li + (1 - PINCH_EMA) * d_li_ema
                     )
-                    d_lm_ema = d_lm if d_lm_ema is None else (
-                        PINCH_EMA * d_lm + (1 - PINCH_EMA) * d_lm_ema
-                    )
                     # arm on a fully open pinch (edge trigger)
                     if d_li > cfg.pinch_open:
                         armed_l = True
-                    if d_lm > cfg.pinch_open:
-                        armed_r = True
                     if (
                         engaged
                         and not scroll_active
                         and not lmb_down
-                        and not rmb_down
                         and now - last_press_t >= PRESS_REFRACTORY_S
+                        and now - engaged_at >= ENGAGE_GRACE_S
                     ):
-                        # press fires on the threshold crossing: zero added
-                        # latency (the Jota CHI'13 direct-manipulation rule)
-                        if armed_l and pinch_l_valid(raw, cfg.pinch_close):
+                        # press fires on the threshold crossing (zero
+                        # added dwell); the median window is the only
+                        # added latency and it kills the one-frame spikes
+                        # that chained false down/up bursts
+                        if armed_l and pinch_l_fire(d_li, d46, cfg.pinch_close):
                             act.press(Button.left)
                             lmb_down = True
                             armed_l = False
@@ -312,22 +355,6 @@ def main() -> int:
                                 "gesture: LMB down d48=%.2f d46=%.2f",
                                 d_li, d46,
                             )
-                        # the raw dominance gate must ALSO hold on the
-                        # smoothed pair: a single bundled frame mid-entry
-                        # into an LMB pinch (d412 spikes below d48) must
-                        # not fire RMB — the EMA converges in 2-3 frames,
-                        # a sustained middle pinch passes it right after
-                        elif (
-                            armed_r
-                            and pinch_r_valid(raw, cfg.pinch_close)
-                            and d_lm_ema < d_li_ema - RMB_DOMINANCE
-                        ):
-                            act.press(Button.right)
-                            rmb_down = True
-                            armed_r = False
-                            rmb_pressed_at = last_press_t = now
-                            win_presses += 1
-                            logger.info("gesture: RMB down d412=%.2f", d_lm)
                     # release: ONLY the pinch opening (or hand-out above /
                     # grace below). The hand may tighten freely — a natural
                     # strong pinch settles into a bundle (d46 ~0.1) and the
@@ -339,11 +366,6 @@ def main() -> int:
                             act.release(Button.left)
                             lmb_down = False
                             logger.info("gesture: LMB up")
-                    if rmb_down and d_lm_ema > cfg.pinch_open:
-                        if now - rmb_pressed_at >= MIN_HOLD_S:
-                            act.release(Button.right)
-                            rmb_down = False
-                            logger.info("gesture: RMB up")
                 elif now - last_fresh_t > BUTTON_GRACE_S:
                     _release_buttons()  # hand really gone: never leave a stuck button
 
@@ -353,7 +375,6 @@ def main() -> int:
                 if (
                     engaged
                     and not lmb_down
-                    and not rmb_down
                     and scroll_run >= SCROLL_FRAMES
                 ):
                     if not scroll_active:
@@ -393,8 +414,6 @@ def main() -> int:
 
                 if lmb_down:
                     status = "LMB (pinch index) - hold & move = drag"
-                elif rmb_down:
-                    status = "RMB (pinch middle)"
                 elif scroll_active:
                     status = "SCROLL - two fingers, move hand up/down"
                 elif engaged:
@@ -411,13 +430,12 @@ def main() -> int:
                     fps_frames = 0
                     fps_t = now
                     logger.info(
-                        "fps %.1f  hands %s  engaged %s  lmb %s  rmb %s  scroll %s"
+                        "fps %.1f  hands %s  engaged %s  lmb %s  scroll %s"
                         "  sens %.1f  pinch min d48 %.2f d46 %.2f d412 %.2f  presses %d",
                         fps,
                         bool(result),
                         engaged,
                         lmb_down,
-                        rmb_down,
                         scroll_active,
                         act.sensitivity,
                         win_d48,
@@ -437,7 +455,6 @@ def main() -> int:
                         status,
                         active=engaged,
                         lmb=lmb_down,
-                        rmb=rmb_down,
                         scroll=scroll_active,
                     )
 

@@ -18,11 +18,9 @@ HAND_CONNECTIONS = [
 THUMB_TIP = 4
 INDEX_MCP = 5
 INDEX_TIP = 8
-MIDDLE_TIP = 12
 
 GREEN = (0, 255, 0)
 ORANGE = (0, 160, 255)
-BLUE = (255, 160, 0)
 GRAY = (90, 90, 90)
 WHITE = (255, 255, 255)
 
@@ -35,7 +33,6 @@ def draw(
     status: str,
     active: bool = False,
     lmb: bool = False,
-    rmb: bool = False,
     scroll: bool = False,
 ) -> np.ndarray:
     h, w = frame.shape[:2]
@@ -55,12 +52,11 @@ def draw(
         # while the fingertips pinch, so clicks land where the cursor is)
         cx, cy = int(pts[INDEX_MCP][0] * w), int(pts[INDEX_MCP][1] * h)
         cv2.circle(frame, (cx, cy), 9, GREEN if active else ORANGE, 2)
-        # pinch indicators: thumb->index (LMB) and thumb->middle (RMB)
+        # pinch indicator: thumb->index (LMB; the RMB pinch gesture is
+        # removed — this hand's bundle is indistinguishable from it)
         tt = (int(pts[THUMB_TIP][0] * w), int(pts[THUMB_TIP][1] * h))
         it = (int(pts[INDEX_TIP][0] * w), int(pts[INDEX_TIP][1] * h))
-        mt = (int(pts[MIDDLE_TIP][0] * w), int(pts[MIDDLE_TIP][1] * h))
         cv2.line(frame, tt, it, GREEN if lmb else GRAY, 3 if lmb else 1)
-        cv2.line(frame, tt, mt, BLUE if rmb else (60, 60, 60), 3 if rmb else 1)
 
     line1 = f"fps {fps:4.1f}   sens {sens:4.1f}   hand {handed}"
     line2 = "[+/-] sens   [q] quit"

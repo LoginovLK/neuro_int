@@ -27,11 +27,11 @@ class Settings:
     palm_score_threshold: float = 0.4
     landmark_score_threshold: float = 0.25
     # pinch hysteresis, palm-length units: press below the close
-    # threshold, release above the open one (the ~1.7x gap plus the
-    # armed edge-trigger kill flicker; same enter/exit separation idea
-    # as MRTK and Ultraleap)
+    # threshold, release above the open one. open 0.55 -> 0.70: the
+    # user's half-relaxed pinch sits at 0.4-0.6 and chattered across
+    # the old release threshold (measured); a real opening reads 1.0+
     pinch_close: float = 0.32
-    pinch_open: float = 0.55
+    pinch_open: float = 0.70
     debounce_frames: int = 2
     debounce_off_frames: int = 10
     tracking: bool = True
@@ -52,6 +52,8 @@ class Settings:
                     cfg.min_cutoff = 1.2
                 if data.get("beta") in (0.01, 0.006):
                     cfg.beta = 0.004
+                if data.get("pinch_open") == 0.55:
+                    cfg.pinch_open = 0.70
                 return cfg
             except Exception as exc:  # corrupt config -> defaults
                 logging.getLogger(__name__).warning("config %s ignored: %s", p, exc)

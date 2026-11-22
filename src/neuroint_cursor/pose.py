@@ -5,10 +5,11 @@ scale-free in units of the palm length (wrist -> middle MCP):
 
   open hand            -> MOVE  (cursor follows the index knuckle)
   pinch thumb-index    -> LMB press, release on open (click / hold-drag)
-  pinch thumb-middle   -> RMB press, release on open
   index+middle (V)     -> SCROLL: vertical hand travel = wheel steps
   fist / bundle        -> cannot START a click; a held click survives
                           until the pinch opens or the hand leaves frame
+  (RMB pinch removed: this user's bundle is indistinguishable from a
+   thumb-middle pinch on raw distances — 15/15 false fires, see below)
 
 Clicks and drags come from thumb-to-fingertip DISTANCES with hysteresis,
 never from silhouette classification - a distance cannot be faked by
@@ -150,16 +151,25 @@ def is_pinch(
     return _hull_area(pts) <= max_hull * hand * hand
 
 
-def pinch_dist(pts: list[tuple[float, float]], finger: str = "index") -> float:
-    """Thumb-tip to fingertip distance in palm-length units."""
-    hand = palm_length(pts)
-    if hand < 1e-6:
+def pinch_dist(
+    pts: list[tuple[float, float]], finger: str = "index", palm: float | None = None
+) -> float:
+    """Thumb-tip to fingertip distance in palm-length units.
+
+    `palm` substitutes a SMOOTHED palm length: dividing by the instant
+    per-frame palm makes every distance jump when the hand turns
+    edge-on (the projected wrist->MCP collapses and all ratios blow up
+    2-4x — measured live); a slow EMA denominator keeps the units
+    stable for the lifetime of a gesture.
+    """
+    hand = palm if palm is not None else palm_length(pts)
+    if hand is None or hand < 1e-6:
         return 9.9
     tip = {"index": INDEX_TIP, "middle": MIDDLE_TIP}[finger]
     return _dist(pts[THUMB_TIP], pts[tip]) / hand
 
 
-def thumb_pip_dist(pts: list[tuple[float, float]]) -> float:
+def thumb_pip_dist(pts: list[tuple[float, float]], palm: float | None = None) -> float:
     """Thumb-tip to index-PIP distance, palm units — the fist discriminator.
 
     A pinch brings the thumb to the index TIP, a full phalanx away from
@@ -167,8 +177,8 @@ def thumb_pip_dist(pts: list[tuple[float, float]]) -> float:
     the PIP. This one distance separates the two compact hand shapes
     that defeated every silhouette-based guard.
     """
-    hand = palm_length(pts)
-    if hand < 1e-6:
+    hand = palm if palm is not None else palm_length(pts)
+    if hand is None or hand < 1e-6:
         return 9.9
     return _dist(pts[THUMB_TIP], pts[INDEX_PIP]) / hand
 
@@ -204,7 +214,17 @@ def is_move_pose(pts: list[tuple[float, float]]) -> bool:
     return any(finger_states(pts).values()) or hull_ratio(pts) > 1.0
 
 
-def pinch_l_valid(pts: list[tuple[float, float]], close_dist: float) -> bool:
+def pinch_l_fire(d48: float, d46: float, close_dist: float) -> bool:
+    """The LMB press gate on precomputed distances (median-filtered
+    upstream): tips closed AND the thumb at the TIP, not the phalanges."""
+    if d48 >= close_dist:
+        return False
+    return d46 > FIST_GUARD_PIP or (d46 - d48) > FIST_GUARD_DELTA
+
+
+def pinch_l_valid(
+    pts: list[tuple[float, float]], close_dist: float, palm: float | None = None
+) -> bool:
     """LMB pinch guard: thumb-index TIPS closed AND the thumb is at the
     TIP, not on the index phalanges (fist / gathered bundle). Measured on
     real frames: a bundle puts the thumb near BOTH the tip and the PIP
@@ -213,29 +233,17 @@ def pinch_l_valid(pts: list[tuple[float, float]], close_dist: float) -> bool:
     Relaxed other fingers no longer matter — the click does not depend
     on finger styling.
     """
-    d48 = pinch_dist(pts, "index")
-    if d48 >= close_dist:
-        return False
-    d46 = thumb_pip_dist(pts)
-    return d46 > FIST_GUARD_PIP or (d46 - d48) > FIST_GUARD_DELTA
+    return pinch_l_fire(
+        pinch_dist(pts, "index", palm), thumb_pip_dist(pts, palm), close_dist
+    )
 
 
-# RMB dominance: the middle finger must be the CLOSER pinch partner, not
-# just closed (measured live: a real RMB attempt runs d412 ~0.05 with the
-# half-relaxed index at d48 ~0.18 — the old "index fully open at >0.55"
-# gate blocked every attempt; an LMB bundle sits at d412 ~= d48)
-RMB_DOMINANCE = 0.10
-
-
-def pinch_r_valid(pts: list[tuple[float, float]], close_dist: float) -> bool:
-    """RMB pinch guard: thumb-middle closed AND the middle clearly the
-    closest finger to the thumb (d412 < d48 by a dominance margin). An
-    index pinch keeps d48 smaller, so no finger-extension styling is
-    required — a relaxed hand must not fail the gate."""
-    d412 = pinch_dist(pts, "middle")
-    if d412 >= close_dist:
-        return False
-    return d412 < pinch_dist(pts, "index") - RMB_DOMINANCE
+# RMB pinch gesture REMOVED (measured live, 2026-11-22): the user's
+# gathered bundle runs d412 BELOW d48 (0.07 vs 0.14-0.20), so "middle
+# finger dominance" fired 15/15 false RMBs inside bundles and pinch
+# transitions. For this hand no threshold separates a thumb-middle pinch
+# from an index-pinch bundle — the gesture is not implementable on raw
+# distances and stays out until a distinguishable signal exists.
 
 
 def classify(pts: list[tuple[float, float]]) -> str:
