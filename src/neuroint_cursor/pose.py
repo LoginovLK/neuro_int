@@ -3,11 +3,12 @@
 Scheme (Ultraleap / Vision Pro / camera-mouse convention), all checks
 scale-free in units of the palm length (wrist -> middle MCP):
 
-  open hand            -> MOVE  (cursor follows the index knuckle)
+  open hand            -> MOVE  (cursor follows the palm center)
   pinch thumb-index    -> LMB press, release on open (click / hold-drag)
   index+middle (V)     -> SCROLL: vertical hand travel = wheel steps
-  fist / bundle        -> cannot START a click; a held click survives
-                          until the pinch opens or the hand leaves frame
+  fist / bundle (held) -> REST "mouse down": cursor parked (is_fist_bundle,
+                          the exact anti-pinch signature — a frame that
+                          could click can never park, and vice versa)
   (RMB pinch removed: this user's bundle is indistinguishable from a
    thumb-middle pinch on raw distances — 15/15 false fires, see below)
 
@@ -234,6 +235,14 @@ def pinch_l_fire(d48: float, d46: float, close_dist: float) -> bool:
     if d48 >= close_dist:
         return False
     return d46 > FIST_GUARD_PIP or (d46 - d48) > FIST_GUARD_DELTA
+
+
+def is_fist_bundle(d48: float, d46: float) -> bool:
+    """The REST signature — the exact negation of the pinch gate: the
+    thumb sits ON the index phalanges (d46 small) with no tip gap. A
+    frame that could fire a pinch can never count toward rest and vice
+    versa, so parking the cursor can never eat a click."""
+    return d46 < FIST_GUARD_PIP and (d46 - d48) < FIST_GUARD_DELTA
 
 
 def pinch_l_valid(

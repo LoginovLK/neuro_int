@@ -1,14 +1,17 @@
 """neuroint cursor v3 — industry-standard gesture mouse.
 
-Vocabulary (Vision Pro convention — the hand is always active, there is
-NO rest pose; shape flicker can never freeze the cursor):
+Vocabulary (the hand is always active, with ONE explicit held gesture
+for rest — an exact anti-pinch signature debounced 8 frames, never a
+silhouette pose, so it can never coincide with a click frame):
 
-  any hand in frame  -> MOVE   (cursor follows the index knuckle)
+  any hand in frame  -> MOVE   (cursor follows the palm center)
   pinch thumb-index  -> LMB press, release on open (click / hold = drag)
   index+middle (V)   -> SCROLL: vertical hand travel = wheel steps
-  fist / bundle      -> cannot START a click (the d46 guard gates the
-                        press); a click already held lives until the
-                        pinch opens or the hand leaves the frame
+  fist / bundle held -> REST ("put the mouse down"): cursor parked,
+                        nothing fires; open the hand to resume from
+                        the same spot. Never engages while a pinch is
+                        held (exact negation of the pinch gate) and
+                        never during a click.
   hand out of frame  -> release everything, cursor frozen
 
   RMB pinch gesture REMOVED (live 2026-11-22: this hand's bundle runs
@@ -43,6 +46,7 @@ from neuroint_cursor.cursor import CursorActuator
 from neuroint_cursor.overlay import draw
 from neuroint_cursor.pose import (
     INDEX_MCP,
+    is_fist_bundle,
     is_scroll_pose,
     palm_center,
     palm_length,
@@ -80,6 +84,13 @@ MIN_HOLD_S = 0.08
 # no press within this window after engage: the hand often enters the
 # frame already half-closed (measured: a false LMB 22ms after engage)
 ENGAGE_GRACE_S = 0.30
+# REST ("put the mouse down"): a fist/bundle held this long parks the
+# cursor — aiming stops fighting a tired hand. Entry is debounced so
+# hand transitions (which flash compact shapes for 2-4 frames) never
+# park mid-gesture; exit is fast so control resumes the instant the
+# hand opens. Never engages while a button is held.
+REST_FRAMES = 8
+REST_EXIT_FRAMES = 2
 # palm-length EMA for distance normalization: the per-frame projected
 # palm collapses 2-4x when the hand turns edge-on (measured d46 swinging
 # 0.24 -> 2.85 within a second), dragging every threshold along; a slow
@@ -185,6 +196,9 @@ def main() -> int:
     scroll_run = 0        # consecutive SCROLL-pose frames
     scroll_off_run = 0    # consecutive non-scroll frames (scroll exit debounce)
     scroll_active = False
+    rest_run = 0          # consecutive fist/bundle frames (rest entry)
+    rest_exit_run = 0     # consecutive non-rest frames (rest exit)
+    rest_active = False   # "put the mouse down": cursor parked
     lmb_down = False
     # edge-trigger arming: a pinch press only fires when the pinch had
     # fully OPENED first — chatter inside the hysteresis band cannot
@@ -258,9 +272,9 @@ def main() -> int:
                     # not from a coasting (stale) skeleton
                     last_fresh_t = now
 
-                # ---- pose (fresh frames only; NO rest pose: a hand in
-                # frame is active in any shape, hand-out is the pause —
-                # the move/rest flicker froze the cursor 44x per session)
+                # ---- pose (fresh frames only; REST is an explicit held
+                # fist/bundle gesture gated elsewhere — NOT a silhouette
+                # pose, which once froze the cursor 44x per session)
                 pose = "none"
                 raw = getattr(hands, "last_raw", None)
                 if fresh and result is not None:
@@ -306,6 +320,8 @@ def main() -> int:
                     _release_buttons()
                     act.scroll_end()
                     scroll_active = False
+                    rest_active = False
+                    rest_run = rest_exit_run = 0
                     logger.info("released")
 
                 # ---- held buttons (LMB only; the RMB gesture is removed) ----
@@ -339,6 +355,7 @@ def main() -> int:
                     if (
                         engaged
                         and not scroll_active
+                        and not rest_active
                         and not lmb_down
                         and now - last_press_t >= PRESS_REFRACTORY_S
                         and now - engaged_at >= ENGAGE_GRACE_S
@@ -368,6 +385,35 @@ def main() -> int:
                             act.release(Button.left)
                             lmb_down = False
                             logger.info("gesture: LMB up")
+
+                    # ---- REST: "put the mouse down" (fist / bundle) ----
+                    # parks the cursor while the hand relaxes; the entry
+                    # signature is the EXACT negation of the pinch gate,
+                    # so parking can never eat a click, and it never
+                    # engages while a button or scroll is active
+                    rest_now = (
+                        d_li < 9.0
+                        and not lmb_down
+                        and not scroll_active
+                        and is_fist_bundle(d_li, d46)
+                    )
+                    if rest_active:
+                        rest_exit_run = rest_exit_run + 1 if not rest_now else 0
+                        if rest_exit_run >= REST_EXIT_FRAMES:
+                            rest_active = False
+                            rest_exit_run = 0
+                            # rebind the movement reference where the hand
+                            # is NOW (it could move while parked): the
+                            # cursor stays put, no jump on resume
+                            ax, ay = palm_center(raw)
+                            act.reset(ax, ay)
+                            logger.info("gesture: rest off")
+                    else:
+                        rest_run = rest_run + 1 if rest_now else 0
+                        if rest_run >= REST_FRAMES:
+                            rest_active = True
+                            rest_run = 0
+                            logger.info("gesture: rest on")
                 elif now - last_fresh_t > BUTTON_GRACE_S:
                     _release_buttons()  # hand really gone: never leave a stuck button
 
@@ -377,6 +423,7 @@ def main() -> int:
                 if (
                     engaged
                     and not lmb_down
+                    and not rest_active
                     and scroll_run >= SCROLL_FRAMES
                 ):
                     if not scroll_active:
@@ -404,7 +451,7 @@ def main() -> int:
                 # where a single knuckle slides. Inside the actuator an
                 # idle freeze holds the cursor DEAD STILL whenever this
                 # point is not moving (the physical-mouse contract).
-                if engaged and result is not None and not scroll_active:
+                if engaged and result is not None and not scroll_active and not rest_active:
                     ctrl = raw if raw is not None else result[0]
                     fx, fy = palm_center(ctrl)
                     if args.dry:
@@ -421,6 +468,8 @@ def main() -> int:
 
                 if lmb_down:
                     status = "LMB (pinch index) - hold & move = drag"
+                elif rest_active:
+                    status = "REST - cursor parked (fist) | open hand to resume"
                 elif scroll_active:
                     status = "SCROLL - two fingers, move hand up/down"
                 elif engaged:
