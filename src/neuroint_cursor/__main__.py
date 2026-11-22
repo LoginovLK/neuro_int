@@ -1,17 +1,18 @@
 """neuroint cursor v3 — industry-standard gesture mouse.
 
 Vocabulary (the hand is always active, with ONE explicit held gesture
-for rest — an exact anti-pinch signature debounced 8 frames, never a
-silhouette pose, so it can never coincide with a click frame):
+for rest — a closed-hand signature that the pinch gate rejects, so a
+click frame can never park and a parking frame can never click):
 
   any hand in frame  -> MOVE   (cursor follows the palm center)
   pinch thumb-index  -> LMB press, release on open (click / hold = drag)
   index+middle (V)   -> SCROLL: vertical hand travel = wheel steps
   fist / bundle held -> REST ("put the mouse down"): cursor parked,
                         nothing fires; open the hand to resume from
-                        the same spot. Never engages while a pinch is
-                        held (exact negation of the pinch gate) and
-                        never during a click.
+                        the same spot. Signature: fingers drawn to the
+                        thumb (d48 low) in a shape the pinch gate
+                        rejects — a frame that can click can never
+                        park. Never engages while a button is held.
   hand out of frame  -> release everything, cursor frozen
 
   RMB pinch gesture REMOVED (live 2026-11-22: this hand's bundle runs
@@ -46,7 +47,6 @@ from neuroint_cursor.cursor import CursorActuator
 from neuroint_cursor.overlay import draw
 from neuroint_cursor.pose import (
     INDEX_MCP,
-    is_fist_bundle,
     is_scroll_pose,
     palm_center,
     palm_length,
@@ -84,11 +84,18 @@ MIN_HOLD_S = 0.08
 # no press within this window after engage: the hand often enters the
 # frame already half-closed (measured: a false LMB 22ms after engage)
 ENGAGE_GRACE_S = 0.30
-# REST ("put the mouse down"): a fist/bundle held this long parks the
-# cursor — aiming stops fighting a tired hand. Entry is debounced so
-# hand transitions (which flash compact shapes for 2-4 frames) never
-# park mid-gesture; exit is fast so control resumes the instant the
-# hand opens. Never engages while a button is held.
+# REST ("put the mouse down"): a closed hand held this long parks the
+# cursor — aiming stops fighting a tired hand. Measured live: the
+# user's FULL fist runs d48 0.23-0.52 with the thumb OFF the index
+# phalanges (d46 swings 0.33-1.48 — the old d46<0.30 bundle gate never
+# caught it, and the same frames sometimes even fired clicks), while
+# every real pinch press sits under d48 0.32 with a valid pinch gate.
+# So rest = fingers drawn to the thumb (d48 under REST_PARK_D48) in a
+# shape the pinch gate REJECTS: a frame that can click can never park,
+# by construction. Entry debounced so hand transitions (which flash
+# compact shapes for 2-4 frames) never park mid-gesture; exit fast.
+# Never engages while a button is held.
+REST_PARK_D48 = 0.55
 REST_FRAMES = 8
 REST_EXIT_FRAMES = 2
 # palm-length EMA for distance normalization: the per-frame projected
@@ -386,16 +393,16 @@ def main() -> int:
                             lmb_down = False
                             logger.info("gesture: LMB up")
 
-                    # ---- REST: "put the mouse down" (fist / bundle) ----
-                    # parks the cursor while the hand relaxes; the entry
-                    # signature is the EXACT negation of the pinch gate,
-                    # so parking can never eat a click, and it never
-                    # engages while a button or scroll is active
+                    # ---- REST: "put the mouse down" (closed hand) ----
+                    # parks the cursor while the hand relaxes. The closed
+                    # hand is d48 under REST_PARK_D48 in a shape the pinch
+                    # gate REJECTS, so a frame that could click can never
+                    # count toward parking, and a held button never parks
                     rest_now = (
-                        d_li < 9.0
+                        d_li < REST_PARK_D48
                         and not lmb_down
                         and not scroll_active
-                        and is_fist_bundle(d_li, d46)
+                        and not pinch_l_fire(d_li, d46, cfg.pinch_close)
                     )
                     if rest_active:
                         rest_exit_run = rest_exit_run + 1 if not rest_now else 0
@@ -413,6 +420,12 @@ def main() -> int:
                         if rest_run >= REST_FRAMES:
                             rest_active = True
                             rest_run = 0
+                            # a parked hand cannot fire a click on resume
+                            # without fully opening first (armed_l needs
+                            # d48 > pinch_open, which a closed hand never
+                            # reaches) — drop the stale arming anyway so a
+                            # reopening-click sequence starts clean
+                            armed_l = False
                             logger.info("gesture: rest on")
                 elif now - last_fresh_t > BUTTON_GRACE_S:
                     _release_buttons()  # hand really gone: never leave a stuck button
@@ -469,7 +482,7 @@ def main() -> int:
                 if lmb_down:
                     status = "LMB (pinch index) - hold & move = drag"
                 elif rest_active:
-                    status = "REST - cursor parked (fist) | open hand to resume"
+                    status = "REST - cursor parked (closed hand) | open to resume"
                 elif scroll_active:
                     status = "SCROLL - two fingers, move hand up/down"
                 elif engaged:
@@ -486,13 +499,14 @@ def main() -> int:
                     fps_frames = 0
                     fps_t = now
                     logger.info(
-                        "fps %.1f  hands %s  engaged %s  lmb %s  scroll %s"
+                        "fps %.1f  hands %s  engaged %s  lmb %s  scroll %s  rest %s"
                         "  sens %.1f  pinch min d48 %.2f d46 %.2f d412 %.2f  presses %d",
                         fps,
                         bool(result),
                         engaged,
                         lmb_down,
                         scroll_active,
+                        rest_active,
                         act.sensitivity,
                         win_d48,
                         win_d46,
