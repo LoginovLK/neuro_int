@@ -10,7 +10,7 @@ from __future__ import annotations
 import sys
 from collections import deque
 from math import hypot
-from statistics import median
+from statistics import median, pstdev
 
 from pynput.mouse import Button, Controller
 
@@ -48,6 +48,16 @@ OUTLIER_N = 0.20
 # it, anything above slides instead of teleporting (glitches are already
 # gated to zero by OUTLIER_N; this is the last-resort bound)
 MAX_STEP_FRAC = 0.11
+# IDLE FREEZE — the physical-mouse contract: "if I am not moving the
+# hand, the cursor does not move AT ALL". The last FREEZE_WIN control
+# positions clustering tighter than FREEZE_STD of the frame (per axis)
+# means the hand is STILL: the cursor step is zero (not merely slowed)
+# and the increment reference tracks the window MEAN, so landmark drift
+# cannot accumulate while frozen and unfreezing starts from the current
+# spot with no jump. Deliberate motion bursts the spread instantly; the
+# acceleration curve below stays as the second layer for noisier hands.
+FREEZE_WIN = 15   # frames (~0.5s at 30fps)
+FREEZE_STD = 0.006
 
 
 def make_dpi_aware() -> None:
@@ -109,6 +119,8 @@ class CursorActuator:
         self._vel_ema: tuple[float, float] = (0.0, 0.0)
         self._scroll_ref: float | None = None
         self._scroll_acc = 0.0
+        # idle-freeze window over the raw control-point positions
+        self._pos_win: deque[tuple[float, float]] = deque(maxlen=FREEZE_WIN)
 
     @property
     def sensitivity(self) -> float:
@@ -122,11 +134,22 @@ class CursorActuator:
         current control-point position as the movement reference."""
         self._filter.reset()
         self._median_win.clear()
+        self._pos_win.clear()
         self._prev_f = (anchor_fx, anchor_fy)
         self._prev_t = None
         self._vel_ema = (0.0, 0.0)
         pos = self._mouse.position
         self._anchor_cursor = (float(pos[0]), float(pos[1]))
+
+    def _hand_still(self) -> bool:
+        """True when the recent control positions cluster tighter than
+        FREEZE_STD (per axis): the hand is not moving, only landmark
+        noise — the cursor must hold DEAD STILL, like an untouched mouse."""
+        if len(self._pos_win) < self._pos_win.maxlen:
+            return False
+        xs = [p[0] for p in self._pos_win]
+        ys = [p[1] for p in self._pos_win]
+        return max(pstdev(xs), pstdev(ys)) < FREEZE_STD
 
     def _gain_mult(self, speed: float) -> float:
         """Acceleration curve: near-zero speed freezes on target (tremor),
@@ -147,20 +170,37 @@ class CursorActuator:
             dt = max(now_s - self._prev_t, 1.0 / 120.0)
         self._prev_t = now_s
         # per-frame hand increment at base gain (screen px)
+        new_prev = (fx, fy)
         if rebase:
             inc_x = inc_y = 0.0
             self._vel_ema = (0.0, 0.0)
+            self._pos_win.clear()
         else:
             jump_n = hypot(fx - self._prev_f[0], fy - self._prev_f[1])
             if jump_n > OUTLIER_N:
                 # detector glitch (not human motion): hold the cursor,
-                # follow the reference so the next frame is incremental
+                # follow the reference so the next frame is incremental;
+                # the glitch must not pollute the stillness window either
                 self._vel_ema = (0.0, 0.0)
                 inc_x = inc_y = 0.0
             else:
-                inc_x = (fx - self._prev_f[0]) * self.screen_w * self._sensitivity
-                inc_y = (fy - self._prev_f[1]) * self.screen_h * self._sensitivity
-        self._prev_f = (fx, fy)
+                self._pos_win.append((fx, fy))
+                if self._hand_still():
+                    # the hand is STILL (physical-mouse contract): zero
+                    # cursor motion this frame, and the increment
+                    # reference rides the window MEAN so drift cannot
+                    # accumulate while frozen — unfreezing resumes from
+                    # the current spot with no jump
+                    self._vel_ema = (0.0, 0.0)
+                    inc_x = inc_y = 0.0
+                    new_prev = (
+                        sum(p[0] for p in self._pos_win) / len(self._pos_win),
+                        sum(p[1] for p in self._pos_win) / len(self._pos_win),
+                    )
+                else:
+                    inc_x = (fx - self._prev_f[0]) * self.screen_w * self._sensitivity
+                    inc_y = (fy - self._prev_f[1]) * self.screen_h * self._sensitivity
+        self._prev_f = new_prev
         # signed-velocity EMA: tremor oscillates (averages out), a
         # deliberate aim is persistent (full magnitude)
         vx, vy = inc_x / dt, inc_y / dt

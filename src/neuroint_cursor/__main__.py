@@ -44,6 +44,7 @@ from neuroint_cursor.overlay import draw
 from neuroint_cursor.pose import (
     INDEX_MCP,
     is_scroll_pose,
+    palm_center,
     palm_length,
     pinch_dist,
     pinch_l_fire,
@@ -297,7 +298,8 @@ def main() -> int:
                     # same source as the movement control point below —
                     # a shaped-vs-raw mismatch here would hop the cursor
                     anchor_pts = raw if raw is not None else result[0]
-                    act.reset(anchor_pts[INDEX_MCP][0], anchor_pts[INDEX_MCP][1])
+                    ax, ay = palm_center(anchor_pts)
+                    act.reset(ax, ay)
                     logger.info("engaged")
                 elif engaged and idle_run >= cfg.debounce_off_frames:
                     engaged = False
@@ -396,17 +398,22 @@ def main() -> int:
                     act.scroll_feed(scroll_y_ema)
 
                 # ---- cursor movement (drag = pinch held + move) ----
-                # the control point reads the RAW landmarks (like the
-                # gesture distances): the shape-locked skeleton is for
-                # drawing — its re-anchoring lags a fast hand, and a
-                # laggy control point reads as the cursor trailing
+                # the control point is the RAW palm center (wrist + 4
+                # knuckle roots): knuckles barely move when fingers
+                # pinch, and the 5-bone mean holds under wrist rotation
+                # where a single knuckle slides. Inside the actuator an
+                # idle freeze holds the cursor DEAD STILL whenever this
+                # point is not moving (the physical-mouse contract).
                 if engaged and result is not None and not scroll_active:
                     ctrl = raw if raw is not None else result[0]
-                    fx, fy = ctrl[INDEX_MCP][0], ctrl[INDEX_MCP][1]
+                    fx, fy = palm_center(ctrl)
                     if args.dry:
                         moved += 1
+                        # every frame: the old 15-frame thin-out made each
+                        # call a >0.2s rebase, so the idle-freeze path was
+                        # never exercised in dry mode
+                        sx, sy = act.move(fx, fy, now)
                         if moved % 15 == 1:
-                            sx, sy = act.move(fx, fy, now)
                             logger.info("dry: cursor would move to %dx%d", sx, sy)
                     else:
                         act.move(fx, fy, now)

@@ -52,6 +52,20 @@ def palm_length(pts: list[tuple[float, float]]) -> float:
     return _dist(pts[WRIST], pts[MIDDLE_MCP])
 
 
+# the cursor control point: mean of the wrist and the four knuckle roots.
+# Knuckles barely move when fingers flex (bending happens at PIP/DIP),
+# so a pinch does not drag the cursor, and the 5-bone mean is far more
+# stable under wrist rotation than any single landmark — a single index
+# knuckle visibly slides when the hand tilts (measured live).
+PALM_IDS = (WRIST, INDEX_MCP, MIDDLE_MCP, RING_MCP, PINKY_MCP)
+
+
+def palm_center(pts: list[tuple[float, float]]) -> tuple[float, float]:
+    x = sum(pts[i][0] for i in PALM_IDS) / len(PALM_IDS)
+    y = sum(pts[i][1] for i in PALM_IDS) / len(PALM_IDS)
+    return x, y
+
+
 def _bend_deg(tip: tuple[float, float], pip: tuple[float, float], mcp: tuple[float, float]) -> float:
     """Bend at the PIP joint: angle between tip->pip and pip->mcp directions.
 
